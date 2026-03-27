@@ -250,18 +250,109 @@ fn copy_directory(source: &Path, target: &Path) -> Result<(), String> {
         if file_type.is_dir() {
             copy_directory(&entry_path, &target_path)?;
         } else {
-            if let Some(parent) = target_path.parent() {
-                fs::create_dir_all(parent).map_err(|error| {
-                    format!("Impossible de creer {}: {error}", parent.display())
-                })?;
+            copy_file_with_retries(&entry_path, &target_path)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn is_sharing_violation(error: &io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(32) | Some(33))
+}
+
+fn copy_file_with_retries(source: &Path, target: &Path) -> Result<(), String> {
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("Impossible de creer {}: {error}", parent.display()))?;
+    }
+
+    let mut last_error: Option<io::Error> = None;
+    for attempt in 0..4 {
+        match fs::copy(source, target) {
+            Ok(_) => return Ok(()),
+            Err(error) => {
+                let retryable = is_sharing_violation(&error) || error.kind() == io::ErrorKind::PermissionDenied;
+                last_error = Some(error);
+                if retryable && attempt < 3 {
+                    thread::sleep(Duration::from_millis(250));
+                    continue;
+                }
+                break;
             }
-            fs::copy(&entry_path, &target_path).map_err(|error| {
-                format!(
-                    "Impossible de copier {} vers {}: {error}",
-                    entry_path.display(),
-                    target_path.display()
-                )
-            })?;
+        }
+    }
+
+    let error = last_error.unwrap_or_else(|| io::Error::other("copie fichier impossible"));
+    Err(format!(
+        "Impossible de copier {} vers {}: {}",
+        source.display(),
+        target.display(),
+        error
+    ))
+}
+
+fn is_mutable_runtime_path(relative_path: &Path) -> bool {
+    let normalized = relative_path
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy().replace('\\', "/"))
+        .collect::<Vec<_>>()
+        .join("/");
+
+    normalized == "launcher/config/a11-local.env"
+        || normalized == "launcher/config"
+        || normalized == "launcher/models"
+        || normalized.starts_with("launcher/models/")
+        || normalized == "launcher/runtime"
+        || normalized.starts_with("launcher/runtime/")
+        || normalized == "qflush/.qflush"
+        || normalized.starts_with("qflush/.qflush/")
+}
+
+fn sync_directory(source_root: &Path, source: &Path, target: &Path) -> Result<(), String> {
+    if !source.exists() {
+        return Err(format!("Ressource packagee introuvable: {}", source.display()));
+    }
+
+    fs::create_dir_all(target)
+        .map_err(|error| format!("Impossible de creer {}: {error}", target.display()))?;
+
+    for entry in fs::read_dir(source)
+        .map_err(|error| format!("Impossible de lire {}: {error}", source.display()))?
+    {
+        let entry = entry.map_err(|error| format!("Lecture d'entree impossible: {error}"))?;
+        let entry_path = entry.path();
+        let target_path = target.join(entry.file_name());
+        let file_type = entry
+            .file_type()
+            .map_err(|error| format!("Type de fichier indisponible: {error}"))?;
+        let relative_path = entry_path
+            .strip_prefix(source_root)
+            .unwrap_or(&entry_path);
+
+        if file_type.is_dir() {
+            if is_mutable_runtime_path(relative_path) && target_path.exists() {
+                continue;
+            }
+            sync_directory(source_root, &entry_path, &target_path)?;
+        } else {
+            if is_mutable_runtime_path(relative_path) && target_path.exists() {
+                continue;
+            }
+
+            match copy_file_with_retries(&entry_path, &target_path) {
+                Ok(()) => {}
+                Err(error) => {
+                    let locked = fs::metadata(&target_path)
+                        .ok()
+                        .is_some()
+                        && error.contains("utilisé par un autre processus");
+                    if locked {
+                        continue;
+                    }
+                    return Err(error);
+                }
+            }
         }
     }
 
@@ -339,15 +430,7 @@ fn ensure_packaged_runtime(
     let writable_launcher = writable_root.join(&config.paths.packaged_launcher_script);
 
     if should_refresh_runtime_copy(source_root, &writable_root) || !writable_launcher.exists() {
-        if writable_root.exists() {
-            fs::remove_dir_all(&writable_root).map_err(|error| {
-                format!(
-                    "Impossible de reinitialiser la copie runtime {}: {error}",
-                    writable_root.display()
-                )
-            })?;
-        }
-        copy_directory(source_root, &writable_root)?;
+        sync_directory(source_root, source_root, &writable_root)?;
     }
 
     Ok(writable_root)
