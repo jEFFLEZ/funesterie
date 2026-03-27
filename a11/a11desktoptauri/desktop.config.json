@@ -1,0 +1,62 @@
+{
+  "appName": "A11 Local",
+  "shellWindow": {
+    "label": "main",
+    "title": "A11 Local",
+    "width": 560,
+    "height": 760,
+    "minWidth": 520,
+    "minHeight": 720
+  },
+  "chatWindow": {
+    "label": "a11-chat",
+    "title": "A11",
+    "width": 1480,
+    "height": 980,
+    "minWidth": 980,
+    "minHeight": 720
+  },
+  "runtime": {
+    "host": "127.0.0.1",
+    "uiUrl": "http://127.0.0.1:3000",
+    "servicePorts": [
+      {
+        "key": "backend",
+        "label": "Backend",
+        "port": 3000,
+        "required": true,
+        "enableEnvKey": "A11_ENABLE_BACKEND"
+      },
+      {
+        "key": "tts",
+        "label": "TTS",
+        "port": 5002,
+        "required": true,
+        "enableEnvKey": "A11_ENABLE_TTS"
+      },
+      {
+        "key": "llm",
+        "label": "LLM",
+        "port": 8080,
+        "required": true,
+        "enableEnvKey": "A11_ENABLE_LLM"
+      },
+      {
+        "key": "qflush",
+        "label": "Qflush",
+        "port": 43421,
+        "required": false,
+        "enableEnvKey": "A11_ENABLE_QFLUSH"
+      }
+    ]
+  },
+  "paths": {
+    "repoLauncherScript": "../launchers/a11-local.ps1",
+    "repoLauncherConfig": "../launchers/config/a11-local.env",
+    "repoLogsDir": "../launchers/runtime/logs",
+    "packagedRoot": "a11-local",
+    "packagedLauncherScript": "launcher/a11-local.ps1",
+    "packagedLauncherConfig": "launcher/config/a11-local.env",
+    "packagedLogsDir": "launcher/runtime/logs"
+  }
+}

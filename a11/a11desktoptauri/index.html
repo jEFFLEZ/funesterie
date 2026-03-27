@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="fr">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>A11 Local Desktop</title>
+    <link rel="stylesheet" href="/src/styles.css" />
+    <script type="module" src="/src/main.ts" defer></script>
+  </head>
+  <body>
+    <main class="shell">
+      <section class="hero">
+        <div class="brand">
+          <img
+            class="brand__avatar"
+            src="/src/assets/a11-static.png"
+            alt="Avatar A11"
+          />
+          <div>
+            <p class="eyebrow">Desktop shell</p>
+            <h1>A11</h1>
+            <p class="hero__copy">
+              Stack locale unifiee, fenetre native, et chat A11 ouvre en un clic.
+            </p>
+          </div>
+        </div>
+        <span class="phase-pill" id="phase-pill" data-state="busy">Detection...</span>
+      </section>
+
+      <section class="grid">
+        <article class="card">
+          <h2>Demarrage</h2>
+          <p id="summary">
+            Le shell Tauri attend la stack locale A11.
+          </p>
+          <div class="actions">
+            <button class="button-primary" id="launch-btn" type="button">
+              Lancer A11
+            </button>
+            <button class="button-secondary" id="retry-btn" type="button">
+              Relancer
+            </button>
+            <button class="button-ghost" id="open-btn" type="button" hidden>
+              Ouvrir le chat
+            </button>
+          </div>
+        </article>
+
+        <article class="card">
+          <h2>Services</h2>
+          <div class="services" id="services"></div>
+        </article>
+
+        <article class="card">
+          <h2>Controle rapide</h2>
+          <p class="meta">
+            La fenetre ouvre ensuite l'interface A11 locale servie par le backend.
+          </p>
+          <div class="actions">
+            <button class="button-ghost" id="refresh-btn" type="button">
+              Actualiser
+            </button>
+            <button class="button-danger" id="stop-btn" type="button">
+              Arreter
+            </button>
+            <button class="button-secondary" id="logs-btn" type="button">
+              Ouvrir les logs
+            </button>
+          </div>
+          <p class="meta" id="logs-path"></p>
+        </article>
+      </section>
+
+      <p class="hint" id="error-msg" hidden></p>
+    </main>
+  </body>
+</html>
