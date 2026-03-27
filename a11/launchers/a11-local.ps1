@@ -545,10 +545,12 @@ function Write-PackagedConfig {
     "A11_ENABLE_TTS=$([int]$Context.EnableTts)",
     "A11_ENABLE_LLM=$([int]$Context.EnableLlm)",
     "A11_ENABLE_QFLUSH=$([int]$Context.EnableQflush)",
+    "A11_CHAT_PROVIDER_MODE=$($Context.ChatProviderMode)",
     '',
     "A11_BACKEND_PORT=$($Context.BackendPort)",
     "A11_TTS_PORT=$($Context.TtsPort)",
     "A11_LLM_PORT=$($Context.LlmPort)",
+    'A11_LLM_STARTUP_TIMEOUT_SEC=90',
     "A11_QFLUSH_PORT=$($Context.QflushPort)",
     "A11_FRONTEND_PORT=$($Context.FrontendPort)",
     '',
@@ -562,9 +564,15 @@ function Write-PackagedConfig {
     'A11_QFLUSH_DIR=..\qflush',
     'A11_LLM_EXE=..\llm\llm\server\llama-server.exe',
     'A11_LLM_MODEL=..\llm\llm\models\Llama-3.2-3B-Instruct-Q4_K_M.gguf',
+    'A11_LLM_MODEL_CATALOG_ID=llama32-3b-q4km',
+    'A11_LLM_MODEL_URL=',
     'A11_TTS_MODEL=..\tts\fr_FR-siwis-medium.onnx',
     'A11_TTS_PIPER=..\tts\piper.exe',
     'A11_TTS_ESPEAK=..\tts\espeak-ng-data',
+    "A11_REMOTE_PROVIDER_ID=$($Context.RemoteProviderId)",
+    "OPENAI_BASE_URL=$($Context.OpenAiBaseUrl)",
+    'OPENAI_API_KEY=',
+    "OPENAI_MODEL=$($Context.OpenAiModel)",
     '',
     "A11_QFLUSH_CHAT_FLOW=$($Context.QflushChatFlow)",
     "A11_QFLUSH_MEMORY_SUMMARY_FLOW=$($Context.QflushMemorySummaryFlow)",
@@ -606,19 +614,39 @@ function Build-ServiceDefinitions {
   $enableTts = To-BoolValue (Get-ConfigValue $Config 'A11_ENABLE_TTS' '1') $true
   $enableLlm = To-BoolValue (Get-ConfigValue $Config 'A11_ENABLE_LLM' '1') $true
   $enableQflush = To-BoolValue (Get-ConfigValue $Config 'A11_ENABLE_QFLUSH' '0') $false
+  $chatProviderMode = (Get-ConfigValue $Config 'A11_CHAT_PROVIDER_MODE' '').Trim().ToLowerInvariant()
+  $remoteProviderId = Get-ConfigValue $Config 'A11_REMOTE_PROVIDER_ID' ''
+  $openAiBaseUrl = (Get-ConfigValue $Config 'OPENAI_BASE_URL' '').Trim()
+  $openAiApiKey = (Get-ConfigValue $Config 'OPENAI_API_KEY' '').Trim()
+  $openAiModel = (Get-ConfigValue $Config 'OPENAI_MODEL' (Get-ConfigValue $Config 'A11_OPENAI_MODEL' 'gpt-4o-mini')).Trim()
 
   $backendPort = To-IntValue (Get-ConfigValue $Config 'A11_BACKEND_PORT' '3000') 3000
   $ttsPort = To-IntValue (Get-ConfigValue $Config 'A11_TTS_PORT' '5002') 5002
   $llmPort = To-IntValue (Get-ConfigValue $Config 'A11_LLM_PORT' '8080') 8080
+  $llmStartupTimeoutSec = To-IntValue (Get-ConfigValue $Config 'A11_LLM_STARTUP_TIMEOUT_SEC' '90') 90
   $qflushPort = To-IntValue (Get-ConfigValue $Config 'A11_QFLUSH_PORT' '43421') 43421
   $frontendPort = To-IntValue (Get-ConfigValue $Config 'A11_FRONTEND_PORT' '5173') 5173
 
   $qflushChatFlow = Get-ConfigValue $Config 'A11_QFLUSH_CHAT_FLOW' ''
   $qflushMemorySummaryFlow = Get-ConfigValue $Config 'A11_QFLUSH_MEMORY_SUMMARY_FLOW' 'a11.memory.summary.v1'
+
+  if (-not $chatProviderMode) {
+    if ($enableLlm) {
+      $chatProviderMode = 'local'
+    } elseif ($openAiBaseUrl -or $openAiApiKey) {
+      $chatProviderMode = 'remote'
+    } else {
+      $chatProviderMode = 'local'
+    }
+  }
+
+  $useRemoteProvider = $chatProviderMode -eq 'remote' -and -not [string]::IsNullOrWhiteSpace($openAiBaseUrl) -and -not [string]::IsNullOrWhiteSpace($openAiApiKey)
+  $effectiveEnableLlm = $enableLlm -and -not $useRemoteProvider
   $qflushRuntimeUrl = ''
   if ($enableQflush) {
     $qflushRuntimeUrl = $LocalQflushUrl
   }
+  $effectiveQflushChatFlow = if ($enableQflush -and -not $useRemoteProvider) { $qflushChatFlow } else { '' }
   $backendWebDist = ''
   $serveStatic = 'false'
   if ($UiMode -eq 'embedded') {
@@ -634,15 +662,15 @@ function Build-ServiceDefinitions {
   $services += [pscustomobject]@{
     Key = 'llm'
     DisplayName = 'A11 LLM'
-    Enabled = $enableLlm
+    Enabled = $effectiveEnableLlm
     FilePath = $llmExe
     WorkingDirectory = (Split-Path -Parent $llmExe)
     ArgumentList = @('-m', $llmModel, '--port', "$llmPort", '--host', '127.0.0.1')
     Environment = @{}
     Port = $llmPort
     HealthUrl = "http://127.0.0.1:$llmPort/health"
-    HealthMode = 'port'
-    StartupTimeoutSec = 45
+    HealthMode = 'http'
+    StartupTimeoutSec = $llmStartupTimeoutSec
     LogKey = 'llm'
     Issues = @(
       if (-not (Test-Path $llmExe)) { "Missing llama executable: $llmExe" }
@@ -714,22 +742,28 @@ function Build-ServiceDefinitions {
     NODE_ENV = 'development'
     A11_LOCAL_MODE = '1'
     A11_RUNTIME_PROFILE = 'local'
-    BACKEND = 'local'
+    BACKEND = $(if ($useRemoteProvider) { 'openai' } else { 'local' })
     APP_URL = $LocalUiUrl
     FRONT_URL = $LocalUiUrl
     PUBLIC_API_URL = $LocalApiUrl
     API_URL = $LocalApiUrl
-    LOCAL_LLM_URL = $LocalLlmUrl
-    LLAMA_BASE = $LocalLlmUrl
+    LOCAL_LLM_URL = $(if ($effectiveEnableLlm) { $LocalLlmUrl } else { '' })
+    LLAMA_BASE = $(if ($effectiveEnableLlm) { $LocalLlmUrl } else { '' })
     LLAMA_PORT = $llmPort
     LOCAL_LLM_PORT = $llmPort
+    OPENAI_BASE_URL = $openAiBaseUrl
+    OPENAI_API_KEY = $openAiApiKey
+    OPENAI_MODEL = $openAiModel
+    A11_OPENAI_MODEL = $openAiModel
+    A11_REMOTE_PROVIDER_ID = $remoteProviderId
+    A11_CHAT_PROVIDER_MODE = $chatProviderMode
     TTS_PORT = $ttsPort
     TTS_URL = $LocalTtsUrl
     TTS_BASE_URL = $LocalTtsUrl
     TTS_PUBLIC_BASE_URL = $LocalTtsUrl
     QFLUSH_URL = $qflushRuntimeUrl
     QFLUSH_REMOTE_URL = $qflushRuntimeUrl
-    QFLUSH_CHAT_FLOW = $(if ($enableQflush) { $qflushChatFlow } else { '' })
+    QFLUSH_CHAT_FLOW = $effectiveQflushChatFlow
     QFLUSH_MEMORY_SUMMARY_FLOW = $qflushMemorySummaryFlow
     A11_WEB_DIST_DIR = $backendWebDist
     SERVE_STATIC = $serveStatic
@@ -804,8 +838,13 @@ function Build-ServiceDefinitions {
     QflushMemorySummaryFlow = $qflushMemorySummaryFlow
     EnableBackend = $enableBackend
     EnableTts = $enableTts
-    EnableLlm = $enableLlm
+    EnableLlm = $effectiveEnableLlm
     EnableQflush = $enableQflush
+    ChatProviderMode = $chatProviderMode
+    UseRemoteProvider = $useRemoteProvider
+    RemoteProviderId = $remoteProviderId
+    OpenAiBaseUrl = $openAiBaseUrl
+    OpenAiModel = $openAiModel
   }
 }
 
@@ -918,6 +957,19 @@ function Start-A11Stack {
 
   foreach ($service in $definitionBundle.Services) {
     if (-not $service.Enabled) { continue }
+
+    $externalPid = if ($service.Port) { Get-ListeningProcessId -Port $service.Port } else { $null }
+    if ($externalPid) {
+      Write-WarnLine "$($service.DisplayName) already active on port $($service.Port) (PID $externalPid)"
+      $state.services[$service.Key] = @{
+        pid = $externalPid
+        port = $service.Port
+        healthUrl = $service.HealthUrl
+        managedByLauncher = $false
+      }
+      continue
+    }
+
     if ($service.Issues.Count -gt 0) {
       foreach ($issue in $service.Issues) {
         Write-ErrorLine "$($service.DisplayName): $issue"
@@ -946,15 +998,11 @@ function Start-A11Stack {
       continue
     }
 
-    $externalPid = if ($service.Port) { Get-ListeningProcessId -Port $service.Port } else { $null }
-    if ($externalPid) {
-      Write-WarnLine "$($service.DisplayName) already active on port $($service.Port) (PID $externalPid)"
-      $state.services[$service.Key] = @{
-        pid = $externalPid
-        port = $service.Port
-        healthUrl = $service.HealthUrl
-        managedByLauncher = $false
-      }
+    $existingState = $null
+    if ($state.services.ContainsKey($service.Key)) {
+      $existingState = $state.services[$service.Key]
+    }
+    if ($existingState -and ($existingState.managedByLauncher -eq $false) -and $existingState.pid) {
       continue
     }
 
@@ -1207,6 +1255,10 @@ switch ($Command) {
       PublicFrontendUrl = $publicFrontendUrl
       QflushChatFlow = $definitionBundle.QflushChatFlow
       QflushMemorySummaryFlow = $definitionBundle.QflushMemorySummaryFlow
+      ChatProviderMode = $definitionBundle.ChatProviderMode
+      RemoteProviderId = $definitionBundle.RemoteProviderId
+      OpenAiBaseUrl = $definitionBundle.OpenAiBaseUrl
+      OpenAiModel = $definitionBundle.OpenAiModel
     })
     Write-PackagePlanFile -Path (Join-Path $packageRoot 'PACKAGE_LAYOUT_PLAN.md') -Plan $plan -PackageRoot $packageRoot
     Write-Info "Local package staging ready: $packageRoot"
