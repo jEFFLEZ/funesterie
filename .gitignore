@@ -1,0 +1,14 @@
+# Workspace runtime and temp files
+/a11_runtime/
+/tmp-*.log
+
+# Local launcher runtime
+/a11/launchers/runtime/
+
+# Local binaries kept outside Git
+/a11/ngrok.exe
+/a11/.ngrok.exe.old
+
+# OS noise
+Thumbs.db
+.DS_Store
