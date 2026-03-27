@@ -1,10 +1,12 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
+use std::io;
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::Duration;
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder};
 use url::Url;
 
@@ -13,6 +15,7 @@ use std::os::windows::process::CommandExt;
 
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
+const LAUNCHER_TIMEOUT_SEC: u64 = 120;
 
 const DESKTOP_CONFIG_JSON: &str = include_str!("../../desktop.config.json");
 
@@ -23,6 +26,9 @@ struct DesktopConfig {
     shell_window: WindowConfig,
     chat_window: WindowConfig,
     runtime: RuntimeConfig,
+    installer_lite: InstallerLiteConfig,
+    model_catalog: Vec<LocalModelConfig>,
+    remote_providers: Vec<RemoteProviderConfig>,
     paths: PathConfig,
 }
 
@@ -43,6 +49,38 @@ struct RuntimeConfig {
     host: String,
     ui_url: String,
     service_ports: Vec<ServicePortConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct InstallerLiteConfig {
+    enabled: bool,
+    default_model_id: Option<String>,
+    default_model_file_name: String,
+    default_model_url: Option<String>,
+    download_timeout_sec: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalModelConfig {
+    id: String,
+    label: String,
+    file_name: String,
+    download_url: Option<String>,
+    size_hint: Option<String>,
+    description: Option<String>,
+    recommended: Option<bool>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RemoteProviderConfig {
+    id: String,
+    label: String,
+    base_url: Option<String>,
+    default_model: Option<String>,
+    description: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -85,6 +123,10 @@ struct RuntimeSnapshot {
     ui_url: String,
     logs_dir: String,
     services: Vec<ServiceSnapshot>,
+    model_setup: ModelSetupSnapshot,
+    local_models: Vec<LocalModelSnapshot>,
+    remote_providers: Vec<RemoteProviderSnapshot>,
+    remote_setup: RemoteSetupSnapshot,
     message: Option<String>,
 }
 
@@ -98,6 +140,64 @@ struct ServiceSnapshot {
     ready: bool,
     required: bool,
     state: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ModelSetupSnapshot {
+    installer_lite: bool,
+    model_required: bool,
+    model_exists: bool,
+    model_enabled: bool,
+    selected_model_id: String,
+    model_path: String,
+    model_file_name: String,
+    models_directory: String,
+    download_configured: bool,
+    default_model_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalModelSnapshot {
+    id: String,
+    label: String,
+    file_name: String,
+    download_configured: bool,
+    size_hint: Option<String>,
+    description: Option<String>,
+    recommended: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RemoteProviderSnapshot {
+    id: String,
+    label: String,
+    base_url: String,
+    default_model: String,
+    description: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RemoteSetupSnapshot {
+    mode: String,
+    provider_id: String,
+    provider_label: String,
+    base_url: String,
+    model: String,
+    api_key_present: bool,
+    configured: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RemoteProviderFormInput {
+    provider_id: String,
+    base_url: String,
+    model: String,
+    api_key: String,
 }
 
 fn load_desktop_config() -> Result<DesktopConfig, String> {
@@ -342,6 +442,334 @@ fn parse_launcher_env(path: &Path) -> HashMap<String, String> {
     values
 }
 
+fn set_env_value(path: &Path, key: &str, value: &str) -> Result<(), String> {
+    let content = fs::read_to_string(path).unwrap_or_default();
+    let mut lines = content.lines().map(str::to_string).collect::<Vec<_>>();
+    let prefix = format!("{key}=");
+    let updated_line = format!("{prefix}{value}");
+
+    if let Some(existing) = lines.iter_mut().find(|line| line.starts_with(&prefix)) {
+        *existing = updated_line;
+    } else {
+        lines.push(updated_line);
+    }
+
+    let normalized = if lines.is_empty() {
+        String::new()
+    } else {
+        format!("{}\n", lines.join("\n"))
+    };
+
+    fs::write(path, normalized)
+        .map_err(|error| format!("Impossible de mettre a jour {}: {error}", path.display()))
+}
+
+fn launcher_directory(runtime_paths: &RuntimePaths) -> Result<PathBuf, String> {
+    runtime_paths
+        .launcher_script
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| {
+            format!(
+                "Dossier launcher introuvable pour {}",
+                runtime_paths.launcher_script.display()
+            )
+        })
+}
+
+fn build_local_model_snapshots(config: &DesktopConfig) -> Vec<LocalModelSnapshot> {
+    config
+        .model_catalog
+        .iter()
+        .map(|entry| LocalModelSnapshot {
+            id: entry.id.clone(),
+            label: entry.label.clone(),
+            file_name: entry.file_name.clone(),
+            download_configured: entry
+                .download_url
+                .as_ref()
+                .map(|value| !value.trim().is_empty())
+                .unwrap_or(false),
+            size_hint: entry.size_hint.clone(),
+            description: entry.description.clone(),
+            recommended: entry.recommended.unwrap_or(false),
+        })
+        .collect()
+}
+
+fn build_remote_provider_snapshots(config: &DesktopConfig) -> Vec<RemoteProviderSnapshot> {
+    config
+        .remote_providers
+        .iter()
+        .map(|provider| RemoteProviderSnapshot {
+            id: provider.id.clone(),
+            label: provider.label.clone(),
+            base_url: provider.base_url.clone().unwrap_or_default(),
+            default_model: provider.default_model.clone().unwrap_or_default(),
+            description: provider.description.clone(),
+        })
+        .collect()
+}
+
+fn default_local_model_id(config: &DesktopConfig) -> String {
+    if let Some(default_id) = config
+        .installer_lite
+        .default_model_id
+        .as_ref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        return default_id.clone();
+    }
+
+    if let Some(recommended) = config
+        .model_catalog
+        .iter()
+        .find(|entry| entry.recommended.unwrap_or(false))
+    {
+        return recommended.id.clone();
+    }
+
+    config
+        .model_catalog
+        .first()
+        .map(|entry| entry.id.clone())
+        .unwrap_or_else(|| "default".to_string())
+}
+
+fn find_local_model_config<'a>(
+    config: &'a DesktopConfig,
+    model_id: &str,
+) -> Option<&'a LocalModelConfig> {
+    config
+        .model_catalog
+        .iter()
+        .find(|entry| entry.id.eq_ignore_ascii_case(model_id))
+}
+
+fn find_remote_provider_config<'a>(
+    config: &'a DesktopConfig,
+    provider_id: &str,
+) -> Option<&'a RemoteProviderConfig> {
+    config
+        .remote_providers
+        .iter()
+        .find(|entry| entry.id.eq_ignore_ascii_case(provider_id))
+}
+
+fn resolve_remote_setup_from_flags(
+    config: &DesktopConfig,
+    flags: &HashMap<String, String>,
+) -> RemoteSetupSnapshot {
+    let mode = flags
+        .get("A11_CHAT_PROVIDER_MODE")
+        .cloned()
+        .unwrap_or_else(|| "local".to_string())
+        .trim()
+        .to_ascii_lowercase();
+    let provider_id = flags
+        .get("A11_REMOTE_PROVIDER_ID")
+        .cloned()
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let base_url = flags
+        .get("OPENAI_BASE_URL")
+        .cloned()
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let model = flags
+        .get("OPENAI_MODEL")
+        .or_else(|| flags.get("A11_OPENAI_MODEL"))
+        .cloned()
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let api_key_present = flags
+        .get("OPENAI_API_KEY")
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false);
+    let provider_label = find_remote_provider_config(config, &provider_id)
+        .map(|provider| provider.label.clone())
+        .unwrap_or_else(|| provider_id.clone());
+    let configured = mode == "remote" && !base_url.is_empty() && api_key_present;
+
+    RemoteSetupSnapshot {
+        mode,
+        provider_id,
+        provider_label,
+        base_url,
+        model,
+        api_key_present,
+        configured,
+    }
+}
+
+fn resolve_model_setup_from_flags(
+    config: &DesktopConfig,
+    runtime_paths: &RuntimePaths,
+    flags: &HashMap<String, String>,
+) -> Result<ModelSetupSnapshot, String> {
+    let launcher_dir = launcher_directory(runtime_paths)?;
+    let selected_model_id = flags
+        .get("A11_LLM_MODEL_CATALOG_ID")
+        .cloned()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| default_local_model_id(config));
+    let selected_model = find_local_model_config(config, &selected_model_id);
+    let configured_model = flags
+        .get("A11_LLM_MODEL")
+        .cloned()
+        .unwrap_or_else(|| {
+            selected_model
+                .map(|model| format!("models\\{}", model.file_name))
+                .unwrap_or_else(|| format!("models\\{}", config.installer_lite.default_model_file_name))
+        });
+    let model_path = resolve_relative(&launcher_dir, &configured_model);
+    let model_file_name = selected_model
+        .map(|model| model.file_name.clone())
+        .or_else(|| {
+            model_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(ToOwned::to_owned)
+        })
+        .unwrap_or_else(|| config.installer_lite.default_model_file_name.clone());
+    let models_directory = model_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| launcher_dir.join("models"));
+    let installer_lite = flags
+        .get("A11_INSTALLER_LITE")
+        .map(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(config.installer_lite.enabled && runtime_paths.launcher_mode != "repo");
+    let model_enabled = flags
+        .get("A11_ENABLE_LLM")
+        .map(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(true);
+    let default_model_url = flags
+        .get("A11_LLM_MODEL_URL")
+        .cloned()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            selected_model
+                .and_then(|entry| entry.download_url.clone())
+                .filter(|value| !value.trim().is_empty())
+        })
+        .or_else(|| {
+            config
+                .installer_lite
+                .default_model_url
+                .clone()
+                .filter(|value| !value.trim().is_empty())
+        });
+    let model_exists = model_path.exists();
+
+    Ok(ModelSetupSnapshot {
+        installer_lite,
+        model_required: installer_lite && !model_exists,
+        model_exists,
+        model_enabled,
+        selected_model_id,
+        model_path: model_path.display().to_string(),
+        model_file_name,
+        models_directory: models_directory.display().to_string(),
+        download_configured: default_model_url.is_some(),
+        default_model_url,
+    })
+}
+
+fn resolve_model_setup(
+    config: &DesktopConfig,
+    runtime_paths: &RuntimePaths,
+) -> Result<ModelSetupSnapshot, String> {
+    let flags = parse_launcher_env(&runtime_paths.launcher_config);
+    resolve_model_setup_from_flags(config, runtime_paths, &flags)
+}
+
+fn prepare_model_slot(
+    config: &DesktopConfig,
+    runtime_paths: &RuntimePaths,
+    preferred_file_name: Option<&str>,
+) -> Result<(ModelSetupSnapshot, PathBuf), String> {
+    let launcher_dir = launcher_directory(runtime_paths)?;
+    let current = resolve_model_setup(config, runtime_paths)?;
+    let model_file_name = preferred_file_name
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(&current.model_file_name);
+    let model_relative = format!("models\\{model_file_name}");
+    let model_path = resolve_relative(&launcher_dir, &model_relative);
+    if let Some(parent) = model_path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("Impossible de creer {}: {error}", parent.display()))?;
+    }
+    set_env_value(&runtime_paths.launcher_config, "A11_LLM_MODEL", &model_relative)?;
+    set_env_value(&runtime_paths.launcher_config, "A11_ENABLE_LLM", "1")?;
+    set_env_value(&runtime_paths.launcher_config, "A11_INSTALLER_LITE", "1")?;
+    let updated = resolve_model_setup(config, runtime_paths)?;
+    Ok((updated, model_path))
+}
+
+fn apply_local_model_profile(
+    config: &DesktopConfig,
+    runtime_paths: &RuntimePaths,
+    model_id: &str,
+) -> Result<ModelSetupSnapshot, String> {
+    let model = find_local_model_config(config, model_id)
+        .ok_or_else(|| format!("Profil local inconnu: {model_id}"))?;
+    let launcher_dir = launcher_directory(runtime_paths)?;
+    let model_relative = format!("models\\{}", model.file_name);
+    let model_path = resolve_relative(&launcher_dir, &model_relative);
+    if let Some(parent) = model_path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("Impossible de creer {}: {error}", parent.display()))?;
+    }
+
+    set_env_value(&runtime_paths.launcher_config, "A11_LLM_MODEL_CATALOG_ID", &model.id)?;
+    set_env_value(&runtime_paths.launcher_config, "A11_LLM_MODEL", &model_relative)?;
+    set_env_value(
+        &runtime_paths.launcher_config,
+        "A11_LLM_MODEL_URL",
+        model.download_url.as_deref().unwrap_or(""),
+    )?;
+    set_env_value(&runtime_paths.launcher_config, "A11_CHAT_PROVIDER_MODE", "local")?;
+    set_env_value(&runtime_paths.launcher_config, "A11_ENABLE_LLM", "1")?;
+    set_env_value(&runtime_paths.launcher_config, "A11_ENABLE_QFLUSH", "1")?;
+    set_env_value(&runtime_paths.launcher_config, "A11_INSTALLER_LITE", "1")?;
+
+    resolve_model_setup(config, runtime_paths)
+}
+
+fn apply_remote_provider_config(
+    runtime_paths: &RuntimePaths,
+    provider_id: &str,
+    base_url: &str,
+    model: &str,
+    api_key: &str,
+) -> Result<(), String> {
+    set_env_value(&runtime_paths.launcher_config, "A11_CHAT_PROVIDER_MODE", "remote")?;
+    set_env_value(&runtime_paths.launcher_config, "A11_REMOTE_PROVIDER_ID", provider_id)?;
+    set_env_value(&runtime_paths.launcher_config, "OPENAI_BASE_URL", base_url)?;
+    set_env_value(&runtime_paths.launcher_config, "OPENAI_MODEL", model)?;
+    set_env_value(&runtime_paths.launcher_config, "OPENAI_API_KEY", api_key)?;
+    set_env_value(&runtime_paths.launcher_config, "A11_ENABLE_LLM", "0")?;
+    set_env_value(&runtime_paths.launcher_config, "A11_ENABLE_QFLUSH", "1")?;
+    set_env_value(&runtime_paths.launcher_config, "A11_INSTALLER_LITE", "0")?;
+    Ok(())
+}
+
+fn reset_remote_provider_config(runtime_paths: &RuntimePaths) -> Result<(), String> {
+    set_env_value(&runtime_paths.launcher_config, "A11_CHAT_PROVIDER_MODE", "local")?;
+    set_env_value(&runtime_paths.launcher_config, "A11_REMOTE_PROVIDER_ID", "")?;
+    set_env_value(&runtime_paths.launcher_config, "OPENAI_BASE_URL", "")?;
+    set_env_value(&runtime_paths.launcher_config, "OPENAI_MODEL", "")?;
+    set_env_value(&runtime_paths.launcher_config, "OPENAI_API_KEY", "")?;
+    set_env_value(&runtime_paths.launcher_config, "A11_ENABLE_LLM", "1")?;
+    set_env_value(&runtime_paths.launcher_config, "A11_ENABLE_QFLUSH", "1")?;
+    set_env_value(&runtime_paths.launcher_config, "A11_INSTALLER_LITE", "1")?;
+    Ok(())
+}
+
 fn env_flag(values: &HashMap<String, String>, key: &str, default: bool) -> bool {
     values
         .get(key)
@@ -371,6 +799,10 @@ fn build_runtime_snapshot(
     let config = load_desktop_config()?;
     let runtime_paths = resolve_runtime_paths(app, &config)?;
     let flags = parse_launcher_env(&runtime_paths.launcher_config);
+    let model_setup = resolve_model_setup_from_flags(&config, &runtime_paths, &flags)?;
+    let remote_setup = resolve_remote_setup_from_flags(&config, &flags);
+    let local_models = build_local_model_snapshots(&config);
+    let remote_providers = build_remote_provider_snapshots(&config);
 
     let services = config
         .runtime
@@ -401,10 +833,21 @@ fn build_runtime_snapshot(
         })
         .collect::<Vec<_>>();
 
-    let ready = services
+    let required_services_ready = services
         .iter()
         .filter(|service| service.required && service.enabled)
         .all(|service| service.ready);
+    let ready = required_services_ready
+        && (!model_setup.installer_lite || (model_setup.model_exists && model_setup.model_enabled));
+
+    let resolved_message = if ready || !model_setup.installer_lite || model_setup.model_exists {
+        message
+    } else {
+        Some(format!(
+            "Modele local requis avant le demarrage du LLM. Ajoute {} puis relance A11.",
+            model_setup.model_file_name
+        ))
+    };
 
     Ok(RuntimeSnapshot {
         app_name: config.app_name,
@@ -413,7 +856,11 @@ fn build_runtime_snapshot(
         ui_url: config.runtime.ui_url,
         logs_dir: runtime_paths.logs_dir.display().to_string(),
         services,
-        message,
+        model_setup,
+        local_models,
+        remote_providers,
+        remote_setup,
+        message: resolved_message,
     })
 }
 
@@ -454,9 +901,49 @@ fn run_launcher_command(
         command.creation_flags(CREATE_NO_WINDOW);
     }
 
-    let output = command
-        .output()
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
+
+    let mut child = command
+        .spawn()
         .map_err(|error| format!("Impossible d'executer le launcher: {error}"))?;
+
+    let child_pid = child.id();
+    let deadline = Instant::now() + Duration::from_secs(LAUNCHER_TIMEOUT_SEC);
+
+    loop {
+        match child
+            .try_wait()
+            .map_err(|error| format!("Impossible de surveiller le launcher: {error}"))?
+        {
+            Some(_) => break,
+            None => {
+                if Instant::now() >= deadline {
+                    #[cfg(target_os = "windows")]
+                    {
+                        let _ = Command::new("taskkill")
+                            .args(["/PID", &child_pid.to_string(), "/T", "/F"])
+                            .creation_flags(CREATE_NO_WINDOW)
+                            .output();
+                    }
+                    #[cfg(not(target_os = "windows"))]
+                    {
+                        let _ = child.kill();
+                    }
+                    let _ = child.wait();
+                    return Err(format!(
+                        "Le launcher a depasse le delai de {} secondes pendant '{command_name}'.",
+                        LAUNCHER_TIMEOUT_SEC
+                    ));
+                }
+                thread::sleep(Duration::from_millis(250));
+            }
+        }
+    }
+
+    let output = child
+        .wait_with_output()
+        .map_err(|error| format!("Impossible de recuperer la sortie du launcher: {error}"))?;
 
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -495,6 +982,16 @@ async fn start_stack(app: AppHandle) -> Result<RuntimeSnapshot, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let config = load_desktop_config()?;
         let runtime_paths = resolve_runtime_paths(&app, &config)?;
+        let model_setup = resolve_model_setup(&config, &runtime_paths)?;
+        if model_setup.installer_lite && (!model_setup.model_exists || !model_setup.model_enabled) {
+            return build_runtime_snapshot(
+                &app,
+                Some(format!(
+                    "Modele local requis avant le demarrage du LLM. Ajoute {} puis relance A11.",
+                    model_setup.model_file_name
+                )),
+            );
+        }
         let mut extra_args = vec!["-NoPause", "-NoOpen"];
         if runtime_paths.skip_ui_build {
             extra_args.push("-SkipUiBuild");
@@ -547,6 +1044,241 @@ fn open_logs_directory(app: AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn open_model_directory(app: AppHandle) -> Result<(), String> {
+    let config = load_desktop_config()?;
+    let runtime_paths = resolve_runtime_paths(&app, &config)?;
+    let model_setup = resolve_model_setup(&config, &runtime_paths)?;
+    let target_dir = PathBuf::from(&model_setup.models_directory);
+
+    if !target_dir.exists() {
+        fs::create_dir_all(&target_dir).map_err(|error| {
+            format!(
+                "Impossible de creer le dossier modele {}: {error}",
+                target_dir.display()
+            )
+        })?;
+    }
+
+    let mut command = Command::new("explorer.exe");
+    command.arg(&target_dir);
+
+    #[cfg(target_os = "windows")]
+    {
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    command
+        .spawn()
+        .map_err(|error| format!("Impossible d'ouvrir le dossier modele: {error}"))?;
+
+    Ok(())
+}
+
+#[tauri::command]
+async fn import_external_model(app: AppHandle) -> Result<RuntimeSnapshot, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let config = load_desktop_config()?;
+        let runtime_paths = resolve_runtime_paths(&app, &config)?;
+        let source_path = rfd::FileDialog::new()
+            .add_filter("GGUF", &["gguf"])
+            .set_title("Choisir un modele GGUF pour A11")
+            .pick_file()
+            .ok_or_else(|| "Aucun modele GGUF selectionne.".to_string())?;
+        let current_setup = resolve_model_setup(&config, &runtime_paths)?;
+        let target_file_name = if current_setup.model_file_name.trim().is_empty() {
+            source_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or(&config.installer_lite.default_model_file_name)
+                .to_string()
+        } else {
+            current_setup.model_file_name.clone()
+        };
+        let (_model_setup, target_path) =
+            prepare_model_slot(&config, &runtime_paths, Some(&target_file_name))?;
+
+        if source_path != target_path {
+            fs::copy(&source_path, &target_path).map_err(|error| {
+                format!(
+                    "Impossible de copier {} vers {}: {error}",
+                    source_path.display(),
+                    target_path.display()
+                )
+            })?;
+        }
+
+        build_runtime_snapshot(
+            &app,
+            Some(format!("Modele importe: {}", target_path.display())),
+        )
+    })
+    .await
+    .map_err(|error| format!("Import modele impossible: {error}"))?
+}
+
+#[tauri::command]
+async fn download_default_model(app: AppHandle) -> Result<RuntimeSnapshot, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let config = load_desktop_config()?;
+        let runtime_paths = resolve_runtime_paths(&app, &config)?;
+        let current_setup = resolve_model_setup(&config, &runtime_paths)?;
+        let download_url = current_setup
+            .default_model_url
+            .clone()
+            .ok_or_else(|| "Aucune URL de telechargement de modele n'est configuree pour cet installeur lite.".to_string())?;
+        let timeout = config.installer_lite.download_timeout_sec.unwrap_or(14_400);
+        let (_updated_setup, target_path) = prepare_model_slot(
+            &config,
+            &runtime_paths,
+            Some(&current_setup.model_file_name),
+        )?;
+
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(timeout))
+            .build()
+            .map_err(|error| format!("Client HTTP modele indisponible: {error}"))?;
+
+        let mut response = client
+            .get(&download_url)
+            .send()
+            .map_err(|error| format!("Telechargement modele impossible: {error}"))?;
+        if !response.status().is_success() {
+            return Err(format!(
+                "Telechargement modele en echec: HTTP {}",
+                response.status()
+            ));
+        }
+
+        let temp_path = target_path.with_extension("gguf.part");
+        if let Some(parent) = temp_path.parent() {
+            fs::create_dir_all(parent).map_err(|error| {
+                format!("Impossible de creer {}: {error}", parent.display())
+            })?;
+        }
+        let mut output = fs::File::create(&temp_path)
+            .map_err(|error| format!("Impossible de creer {}: {error}", temp_path.display()))?;
+        io::copy(&mut response, &mut output)
+            .map_err(|error| format!("Ecriture modele impossible: {error}"))?;
+        fs::rename(&temp_path, &target_path).map_err(|error| {
+            format!(
+                "Impossible de finaliser le modele {}: {error}",
+                target_path.display()
+            )
+        })?;
+
+        build_runtime_snapshot(
+            &app,
+            Some(format!("Modele telecharge: {}", target_path.display())),
+        )
+    })
+    .await
+    .map_err(|error| format!("Installation modele impossible: {error}"))?
+}
+
+#[tauri::command]
+async fn select_local_model_profile(
+    app: AppHandle,
+    model_id: String,
+) -> Result<RuntimeSnapshot, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let config = load_desktop_config()?;
+        let runtime_paths = resolve_runtime_paths(&app, &config)?;
+        let applied = apply_local_model_profile(&config, &runtime_paths, model_id.trim())?;
+        build_runtime_snapshot(
+            &app,
+            Some(format!(
+                "Profil local selectionne: {}",
+                applied.model_file_name
+            )),
+        )
+    })
+    .await
+    .map_err(|error| format!("Selection du profil local impossible: {error}"))?
+}
+
+#[tauri::command]
+async fn save_remote_provider_config(
+    app: AppHandle,
+    input: RemoteProviderFormInput,
+) -> Result<RuntimeSnapshot, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let config = load_desktop_config()?;
+        let runtime_paths = resolve_runtime_paths(&app, &config)?;
+        let existing_flags = parse_launcher_env(&runtime_paths.launcher_config);
+        let provider_id = input.provider_id.trim().to_string();
+        let preset = find_remote_provider_config(&config, &provider_id);
+        let base_url = if input.base_url.trim().is_empty() {
+            preset
+                .and_then(|entry| entry.base_url.clone())
+                .unwrap_or_default()
+        } else {
+            input.base_url.trim().to_string()
+        };
+        let model = if input.model.trim().is_empty() {
+            preset
+                .and_then(|entry| entry.default_model.clone())
+                .unwrap_or_default()
+        } else {
+            input.model.trim().to_string()
+        };
+        let api_key = if input.api_key.trim().is_empty() {
+            existing_flags
+                .get("OPENAI_API_KEY")
+                .cloned()
+                .unwrap_or_default()
+                .trim()
+                .to_string()
+        } else {
+            input.api_key.trim().to_string()
+        };
+
+        if base_url.trim().is_empty() {
+            return Err("Base URL du fournisseur distant requise.".to_string());
+        }
+        if model.trim().is_empty() {
+            return Err("Nom du modele distant requis.".to_string());
+        }
+        if api_key.trim().is_empty() {
+            return Err("Cle API requise pour le fournisseur distant.".to_string());
+        }
+
+        apply_remote_provider_config(
+            &runtime_paths,
+            &provider_id,
+            &base_url,
+            &model,
+            &api_key,
+        )?;
+
+        build_runtime_snapshot(
+            &app,
+            Some(format!(
+                "Fournisseur distant configure: {}",
+                preset
+                    .map(|entry| entry.label.clone())
+                    .unwrap_or_else(|| provider_id.clone())
+            )),
+        )
+    })
+    .await
+    .map_err(|error| format!("Configuration du fournisseur distant impossible: {error}"))?
+}
+
+#[tauri::command]
+async fn switch_back_to_local_llm(app: AppHandle) -> Result<RuntimeSnapshot, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let config = load_desktop_config()?;
+        let runtime_paths = resolve_runtime_paths(&app, &config)?;
+        reset_remote_provider_config(&runtime_paths)?;
+        let current_id = resolve_model_setup(&config, &runtime_paths)?.selected_model_id;
+        let _ = apply_local_model_profile(&config, &runtime_paths, &current_id)?;
+        build_runtime_snapshot(&app, Some("Retour au moteur local A11.".to_string()))
+    })
+    .await
+    .map_err(|error| format!("Retour au moteur local impossible: {error}"))?
+}
+
+#[tauri::command]
 fn open_chat_window(app: AppHandle) -> Result<(), String> {
     let config = load_desktop_config()?;
     let snapshot = build_runtime_snapshot(&app, None)?;
@@ -595,6 +1327,12 @@ pub fn run() {
             start_stack,
             stop_stack,
             open_logs_directory,
+            open_model_directory,
+            import_external_model,
+            download_default_model,
+            select_local_model_profile,
+            save_remote_provider_config,
+            switch_back_to_local_llm,
             open_chat_window,
             close_shell_window
         ])

@@ -1003,7 +1003,14 @@ function Start-A11Stack {
       $existingState = $state.services[$service.Key]
     }
     if ($existingState -and ($existingState.managedByLauncher -eq $false) -and $existingState.pid) {
-      continue
+      $externalStatus = Get-ServiceStatus -Service $service -StateServices $state.services
+      if ($externalStatus.State -eq 'running-external' -or $externalStatus.State -eq 'degraded-external' -or $externalStatus.State -eq 'disabled-external') {
+        continue
+      }
+
+      Write-WarnLine "$($service.DisplayName) stale external state cleared (PID $($existingState.pid))"
+      [void]$state.services.Remove($service.Key)
+      Save-State -Path $stateFile -State $state
     }
 
     $started = Start-ManagedProcess -Service $service -LogsDirectory $logsDirectory -ShowWindow:$ShowWindows
