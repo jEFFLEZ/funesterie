@@ -72,6 +72,24 @@ bootstrap.bat online --check-only --no-pause
 - `online`
   Delegue vers `a11\launchers\start-prod-a11.ps1`.
 
+## Vue IDE
+
+Pour retrouver une vue "un seul tronc / plusieurs arbres" dans VS Code, ouvre:
+
+```text
+funesterie.code-workspace
+```
+
+Cette workspace affiche separement:
+
+- `A11 Launchers`
+- `A11 Backend`
+- `A11 Frontend`
+- `A11 LLM`
+- `A11 Qflush`
+
+et masque les gros dossiers bruitants comme `node_modules`, `dist`, `.git` et les runtimes locaux.
+
 ## Note
 
 `D:\dragon` reste un projet separe et est pousse dans son propre depot `dragon`.
