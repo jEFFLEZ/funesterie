@@ -72,6 +72,7 @@ const state = {
 };
 const STARTUP_POLL_MS = 2000;
 const STARTUP_TIMEOUT_MS = 8 * 60 * 1000;
+const SNAPSHOT_TIMEOUT_MS = 5000;
 
 const phasePill = document.querySelector<HTMLElement>("#phase-pill");
 const summaryEl = document.querySelector<HTMLElement>("#summary");
@@ -391,6 +392,13 @@ async function fetchSnapshot() {
   return snapshot;
 }
 
+async function fetchSnapshotWithTimeout(timeoutMs = SNAPSHOT_TIMEOUT_MS) {
+  return await Promise.race<RuntimeSnapshot | null>([
+    fetchSnapshot(),
+    new Promise<null>((resolve) => window.setTimeout(() => resolve(null), timeoutMs)),
+  ]);
+}
+
 async function openChatWindow() {
   await invoke("open_chat_window");
 }
@@ -674,7 +682,11 @@ window.addEventListener("DOMContentLoaded", async () => {
 
   setBusy(true, "Detection");
   try {
-    const snapshot = await fetchSnapshot();
+    const snapshot = await fetchSnapshotWithTimeout();
+    if (!snapshot) {
+      renderNotice("La detection locale prend trop de temps. Le shell reste utilisable: clique sur Lancer A11 ou Actualiser.");
+      return;
+    }
     if (snapshot.ready) {
       renderNotice("A11 est deja pret. Ouvre le chat quand tu veux.");
       return;
