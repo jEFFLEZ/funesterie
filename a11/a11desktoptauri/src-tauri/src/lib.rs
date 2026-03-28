@@ -15,7 +15,7 @@ use std::os::windows::process::CommandExt;
 
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
-const LAUNCHER_TIMEOUT_SEC: u64 = 120;
+const LAUNCHER_TIMEOUT_SEC: u64 = 300;
 
 const DESKTOP_CONFIG_JSON: &str = include_str!("../../desktop.config.json");
 
@@ -834,6 +834,15 @@ fn env_flag(values: &HashMap<String, String>, key: &str, default: bool) -> bool 
         .unwrap_or(default)
 }
 
+fn service_port(config: &DesktopConfig, key: &str) -> Option<u16> {
+    config
+        .runtime
+        .service_ports
+        .iter()
+        .find(|service| service.key == key)
+        .map(|service| service.port)
+}
+
 fn is_port_ready(host: &str, port: u16) -> bool {
     let endpoint = format!("{host}:{port}");
     let Ok(addresses) = endpoint.to_socket_addrs() else {
@@ -843,6 +852,21 @@ fn is_port_ready(host: &str, port: u16) -> bool {
     addresses.into_iter().any(|address| {
         TcpStream::connect_timeout(&address, Duration::from_millis(350)).is_ok()
     })
+}
+
+fn ensure_model_target_can_be_updated(config: &DesktopConfig, target_path: &Path) -> Result<(), String> {
+    let Some(llm_port) = service_port(config, "llm") else {
+        return Ok(());
+    };
+
+    if target_path.exists() && is_port_ready(&config.runtime.host, llm_port) {
+        return Err(format!(
+            "Le LLM local tourne deja sur le port {} et utilise encore ce slot. Arrete ou relance A11 avant de remplacer ce modele.",
+            llm_port
+        ));
+    }
+
+    Ok(())
 }
 
 fn build_runtime_snapshot(
@@ -1017,12 +1041,6 @@ fn run_launcher_command(
     }
 }
 
-fn stop_stack_best_effort(app: &AppHandle) -> Result<(), String> {
-    let config = load_desktop_config()?;
-    let runtime_paths = resolve_runtime_paths(app, &config)?;
-    run_launcher_command(&runtime_paths, "stop", &[]).map(|_| ())
-}
-
 #[tauri::command]
 async fn get_runtime_snapshot(app: AppHandle) -> Result<RuntimeSnapshot, String> {
     tauri::async_runtime::spawn_blocking(move || build_runtime_snapshot(&app, None))
@@ -1066,6 +1084,32 @@ async fn stop_stack(app: AppHandle) -> Result<RuntimeSnapshot, String> {
     })
     .await
     .map_err(|error| format!("Arret impossible: {error}"))?
+}
+
+#[tauri::command]
+async fn restart_stack(app: AppHandle) -> Result<RuntimeSnapshot, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let config = load_desktop_config()?;
+        let runtime_paths = resolve_runtime_paths(&app, &config)?;
+        let model_setup = resolve_model_setup(&config, &runtime_paths)?;
+        if model_setup.installer_lite && (!model_setup.model_exists || !model_setup.model_enabled) {
+            return build_runtime_snapshot(
+                &app,
+                Some(format!(
+                    "Modele local requis avant le redemarrage du LLM. Ajoute {} puis relance A11.",
+                    model_setup.model_file_name
+                )),
+            );
+        }
+        let mut extra_args = vec!["-NoPause", "-NoOpen"];
+        if runtime_paths.skip_ui_build {
+            extra_args.push("-SkipUiBuild");
+        }
+        let message = run_launcher_command(&runtime_paths, "restart", &extra_args)?;
+        build_runtime_snapshot(&app, Some(message))
+    })
+    .await
+    .map_err(|error| format!("Relance impossible: {error}"))?
 }
 
 #[tauri::command]
@@ -1147,6 +1191,9 @@ async fn import_external_model(app: AppHandle) -> Result<RuntimeSnapshot, String
         } else {
             current_setup.model_file_name.clone()
         };
+        let launcher_dir = launcher_directory(&runtime_paths)?;
+        let prospective_target = resolve_relative(&launcher_dir, &format!("models\\{target_file_name}"));
+        ensure_model_target_can_be_updated(&config, &prospective_target)?;
         let (_model_setup, target_path) =
             prepare_model_slot(&config, &runtime_paths, Some(&target_file_name))?;
 
@@ -1180,6 +1227,7 @@ async fn download_default_model(app: AppHandle) -> Result<RuntimeSnapshot, Strin
             .clone()
             .ok_or_else(|| "Aucune URL de telechargement de modele n'est configuree pour cet installeur lite.".to_string())?;
         let timeout = config.installer_lite.download_timeout_sec.unwrap_or(14_400);
+        ensure_model_target_can_be_updated(&config, Path::new(&current_setup.model_path))?;
         let (_updated_setup, target_path) = prepare_model_slot(
             &config,
             &runtime_paths,
@@ -1366,9 +1414,15 @@ fn close_shell_window(app: AppHandle) -> Result<(), String> {
     let config = load_desktop_config()?;
     if let Some(window) = app.get_webview_window(&config.shell_window.label) {
         window
-            .close()
+            .destroy()
             .map_err(|error| format!("Impossible de fermer le shell: {error}"))?;
     }
+    Ok(())
+}
+
+#[tauri::command]
+fn quit_application(app: AppHandle) -> Result<(), String> {
+    app.exit(0);
     Ok(())
 }
 
@@ -1379,6 +1433,7 @@ pub fn run() {
             get_runtime_snapshot,
             start_stack,
             stop_stack,
+            restart_stack,
             open_logs_directory,
             open_model_directory,
             import_external_model,
@@ -1387,13 +1442,10 @@ pub fn run() {
             save_remote_provider_config,
             switch_back_to_local_llm,
             open_chat_window,
-            close_shell_window
+            close_shell_window,
+            quit_application
         ])
         .build(tauri::generate_context!())
         .expect("error while running tauri application")
-        .run(|app, event| {
-            if let tauri::RunEvent::ExitRequested { .. } = event {
-                let _ = stop_stack_best_effort(app);
-            }
-        });
+        .run(|_, _| {});
 }

@@ -74,6 +74,7 @@ const state = {
 const phasePill = document.querySelector<HTMLElement>("#phase-pill");
 const summaryEl = document.querySelector<HTMLElement>("#summary");
 const errorEl = document.querySelector<HTMLElement>("#error-msg");
+const noticeEl = document.querySelector<HTMLElement>("#notice-msg");
 const servicesEl = document.querySelector<HTMLElement>("#services");
 const logsPathEl = document.querySelector<HTMLElement>("#logs-path");
 const launchBtn = document.querySelector<HTMLButtonElement>("#launch-btn");
@@ -82,6 +83,7 @@ const openBtn = document.querySelector<HTMLButtonElement>("#open-btn");
 const refreshBtn = document.querySelector<HTMLButtonElement>("#refresh-btn");
 const stopBtn = document.querySelector<HTMLButtonElement>("#stop-btn");
 const logsBtn = document.querySelector<HTMLButtonElement>("#logs-btn");
+const quitBtn = document.querySelector<HTMLButtonElement>("#quit-btn");
 const modelCard = document.querySelector<HTMLElement>("#model-card");
 const modelSummaryEl = document.querySelector<HTMLElement>("#model-summary");
 const modelPathEl = document.querySelector<HTMLElement>("#model-path");
@@ -99,6 +101,14 @@ const remoteLocalBtn = document.querySelector<HTMLButtonElement>("#remote-local-
 
 function needsModelSetup(snapshot: RuntimeSnapshot | null) {
   return !!snapshot?.modelSetup?.installerLite && !!snapshot?.modelSetup?.modelRequired;
+}
+
+function getService(snapshot: RuntimeSnapshot | null, key: string) {
+  return snapshot?.services?.find((service) => service.key === key) || null;
+}
+
+function isServiceReady(snapshot: RuntimeSnapshot | null, key: string) {
+  return !!getService(snapshot, key)?.ready;
 }
 
 function getSelectedRemoteProvider(snapshot: RuntimeSnapshot | null, providerId?: string | null) {
@@ -145,6 +155,7 @@ function setBusy(busy: boolean, label = "Initialisation") {
     refreshBtn,
     stopBtn,
     logsBtn,
+    quitBtn,
     modelImportBtn,
     modelDownloadBtn,
     modelFolderBtn,
@@ -345,6 +356,13 @@ function renderError(message: string) {
   }
 }
 
+function renderNotice(message: string) {
+  if (noticeEl) {
+    noticeEl.textContent = message;
+    noticeEl.hidden = !message;
+  }
+}
+
 async function fetchSnapshot() {
   const snapshot = await invoke<RuntimeSnapshot>("get_runtime_snapshot");
   state.snapshot = snapshot;
@@ -360,6 +378,7 @@ async function openChatAndCloseShell() {
 async function startStack(label = "Demarrage") {
   setBusy(true, label);
   renderError("");
+  renderNotice("");
   try {
     const snapshot = await invoke<RuntimeSnapshot>("start_stack");
     state.snapshot = snapshot;
@@ -378,6 +397,7 @@ async function startStack(label = "Demarrage") {
 async function stopStack() {
   setBusy(true, "Arret");
   renderError("");
+  renderNotice("");
   try {
     const snapshot = await invoke<RuntimeSnapshot>("stop_stack");
     state.snapshot = snapshot;
@@ -389,10 +409,31 @@ async function stopStack() {
   }
 }
 
+async function restartStack() {
+  setBusy(true, "Relance");
+  renderError("");
+  renderNotice("");
+  try {
+    const snapshot = await invoke<RuntimeSnapshot>("restart_stack");
+    state.snapshot = snapshot;
+    renderSnapshot(snapshot);
+    if (snapshot.ready) {
+      await openChatAndCloseShell();
+    }
+  } catch (error) {
+    renderError(error instanceof Error ? error.message : String(error));
+    await fetchSnapshot().catch(() => null);
+  } finally {
+    setBusy(false);
+  }
+}
+
 async function installExternalModel(mode: "import" | "download") {
   const label = mode === "download" ? "Telechargement du modele" : "Import du modele";
+  const llmWasReady = isServiceReady(state.snapshot, "llm");
   setBusy(true, label);
   renderError("");
+  renderNotice("");
 
   try {
     const snapshot = mode === "download"
@@ -401,7 +442,11 @@ async function installExternalModel(mode: "import" | "download") {
     state.snapshot = snapshot;
     renderSnapshot(snapshot);
     if (!needsModelSetup(snapshot)) {
-      await startStack("Demarrage");
+      if (llmWasReady) {
+        renderNotice("Modele ajoute. Clique sur Relancer pour charger ce LLM.");
+      } else {
+        await startStack("Demarrage");
+      }
     }
   } catch (error) {
     renderError(error instanceof Error ? error.message : String(error));
@@ -415,12 +460,16 @@ async function selectLocalModelProfile(profileId: string) {
   if (!profileId) return;
   setBusy(true, "Profil local");
   renderError("");
+  renderNotice("");
   try {
     const snapshot = await invoke<RuntimeSnapshot>("select_local_model_profile", {
       modelId: profileId,
     });
     state.snapshot = snapshot;
     renderSnapshot(snapshot);
+    if (isServiceReady(snapshot, "llm")) {
+      renderNotice("Profil enregistre. Clique sur Relancer pour appliquer ce moteur.");
+    }
   } catch (error) {
     renderError(error instanceof Error ? error.message : String(error));
     await fetchSnapshot().catch(() => null);
@@ -436,6 +485,7 @@ async function saveRemoteProvider() {
 
   setBusy(true, "IA distante");
   renderError("");
+  renderNotice("");
   try {
     const snapshot = await invoke<RuntimeSnapshot>("save_remote_provider_config", {
       input: {
@@ -448,6 +498,9 @@ async function saveRemoteProvider() {
     remoteApiKeyInput.value = "";
     state.snapshot = snapshot;
     renderSnapshot(snapshot);
+    if (snapshot.services.some((service) => service.ready)) {
+      renderNotice("Configuration enregistree. Clique sur Relancer pour l'appliquer.");
+    }
   } catch (error) {
     renderError(error instanceof Error ? error.message : String(error));
     await fetchSnapshot().catch(() => null);
@@ -459,10 +512,14 @@ async function saveRemoteProvider() {
 async function switchBackToLocalLlm() {
   setBusy(true, "Retour local");
   renderError("");
+  renderNotice("");
   try {
     const snapshot = await invoke<RuntimeSnapshot>("switch_back_to_local_llm");
     state.snapshot = snapshot;
     renderSnapshot(snapshot);
+    if (snapshot.services.some((service) => service.ready)) {
+      renderNotice("Retour au local enregistre. Clique sur Relancer pour recharger le LLM.");
+    }
   } catch (error) {
     renderError(error instanceof Error ? error.message : String(error));
     await fetchSnapshot().catch(() => null);
@@ -477,7 +534,7 @@ window.addEventListener("DOMContentLoaded", async () => {
   });
 
   retryBtn?.addEventListener("click", () => {
-    void startStack("Relance");
+    void restartStack();
   });
 
   openBtn?.addEventListener("click", () => {
@@ -502,6 +559,14 @@ window.addEventListener("DOMContentLoaded", async () => {
 
   logsBtn?.addEventListener("click", () => {
     invoke("open_logs_directory").catch((error) => {
+      renderError(error instanceof Error ? error.message : String(error));
+    });
+  });
+
+  quitBtn?.addEventListener("click", () => {
+    renderError("");
+    renderNotice("");
+    invoke("quit_application").catch((error) => {
       renderError(error instanceof Error ? error.message : String(error));
     });
   });

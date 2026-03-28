@@ -1,5 +1,5 @@
 param(
-  [ValidateSet('start', 'desktop', 'stop', 'status', 'check', 'package')]
+  [ValidateSet('start', 'desktop', 'stop', 'restart', 'status', 'check', 'package')]
   [string]$Command = 'start',
   [string]$ConfigPath = '',
   [switch]$NoOpen,
@@ -236,6 +236,128 @@ function Get-AliveProcess {
   } catch {
     return $null
   }
+}
+
+function Get-ProcessMetadata {
+  param([int]$ProcessId)
+
+  if (-not $ProcessId) {
+    return $null
+  }
+
+  try {
+    return Get-CimInstance Win32_Process -Filter "ProcessId = $ProcessId" -ErrorAction Stop
+  } catch {
+    return $null
+  }
+}
+
+function Test-ServiceOwnedProcess {
+  param(
+    [pscustomobject]$Service,
+    [int]$ProcessId
+  )
+
+  if (-not $ProcessId) {
+    return $false
+  }
+
+  $processInfo = Get-ProcessMetadata -ProcessId $ProcessId
+  if (-not $processInfo) {
+    return $false
+  }
+
+  $serviceExe = ''
+  try {
+    $serviceExe = [System.IO.Path]::GetFullPath([string]$Service.FilePath)
+  } catch {
+    $serviceExe = [string]$Service.FilePath
+  }
+
+  $processExe = [string]$processInfo.ExecutablePath
+  if (-not $processExe) {
+    return $false
+  }
+
+  $sameExecutable = [string]::Equals(
+    $processExe,
+    $serviceExe,
+    [System.StringComparison]::OrdinalIgnoreCase
+  )
+
+  if (-not $sameExecutable) {
+    return $false
+  }
+
+  $commandLine = [string]$processInfo.CommandLine
+  $commandLineLower = $commandLine.ToLowerInvariant()
+  $knownMarkers = switch ($Service.Key) {
+    'llm' { @('llama-server.exe') }
+    'backend' { @('server.cjs') }
+    'tts' { @('siwis.py') }
+    'qflush' { @('qflushd.js') }
+    'frontend' { @('vite') }
+    default { @() }
+  }
+
+  foreach ($marker in $knownMarkers) {
+    if ($commandLineLower.Contains($marker.ToLowerInvariant())) {
+      return $true
+    }
+  }
+
+  if ([string]::IsNullOrWhiteSpace($commandLine)) {
+    return $false
+  }
+
+  $markers = New-Object System.Collections.Generic.List[string]
+
+  if ($Service.WorkingDirectory) {
+    $markers.Add([System.IO.Path]::GetFullPath([string]$Service.WorkingDirectory))
+  }
+
+  foreach ($argument in @($Service.ArgumentList)) {
+    $raw = [string]$argument
+    if ([string]::IsNullOrWhiteSpace($raw)) { continue }
+    if ($raw.StartsWith('-')) { continue }
+    if ($raw -match '^\d+$') { continue }
+
+    $candidate = $raw
+    if ([System.IO.Path]::IsPathRooted($candidate) -or $candidate.Contains('\') -or $candidate.Contains('/')) {
+      $markers.Add([System.IO.Path]::GetFileName($candidate))
+      continue
+    }
+
+    $markers.Add($candidate)
+  }
+
+  foreach ($marker in $markers) {
+    if ([string]::IsNullOrWhiteSpace($marker)) { continue }
+    if ($commandLineLower.Contains($marker.ToLowerInvariant())) {
+      return $true
+    }
+  }
+
+  return $false
+}
+
+function Resolve-OwnedServicePid {
+  param([pscustomobject]$Service)
+
+  if (-not $Service.Port) {
+    return $null
+  }
+
+  $listeningPid = Get-ListeningProcessId -Port $Service.Port
+  if (-not $listeningPid) {
+    return $null
+  }
+
+  if (Test-ServiceOwnedProcess -Service $Service -ProcessId $listeningPid) {
+    return $listeningPid
+  }
+
+  return $null
 }
 
 function Stop-ProcessTree {
@@ -876,6 +998,14 @@ function Get-ServiceStatus {
   if ($Service.Port) {
     $listeningPid = Get-ListeningProcessId -Port $Service.Port
   }
+  if (-not $managedByLauncher -and $listeningPid) {
+    if (Test-ServiceOwnedProcess -Service $Service -ProcessId $listeningPid) {
+      $managedByLauncher = $true
+      if (-not $servicePid) {
+        $servicePid = $listeningPid
+      }
+    }
+  }
   $healthy = $false
   if ($Service.HealthMode -eq 'http') {
     $healthy = Test-HttpReady -Url $Service.HealthUrl -TimeoutSec 2
@@ -960,12 +1090,17 @@ function Start-A11Stack {
 
     $externalPid = if ($service.Port) { Get-ListeningProcessId -Port $service.Port } else { $null }
     if ($externalPid) {
-      Write-WarnLine "$($service.DisplayName) already active on port $($service.Port) (PID $externalPid)"
+      $ownedExternal = Test-ServiceOwnedProcess -Service $service -ProcessId $externalPid
+      if ($ownedExternal) {
+        Write-Info "$($service.DisplayName) already active locally on port $($service.Port) (PID $externalPid)"
+      } else {
+        Write-WarnLine "$($service.DisplayName) already active on port $($service.Port) (PID $externalPid)"
+      }
       $state.services[$service.Key] = @{
         pid = $externalPid
         port = $service.Port
         healthUrl = $service.HealthUrl
-        managedByLauncher = $false
+        managedByLauncher = $ownedExternal
       }
       continue
     }
@@ -1051,6 +1186,81 @@ function Start-A11Stack {
       }
     }
   }
+
+  $finalStatuses = foreach ($service in $definitionBundle.Services) {
+    Get-ServiceStatus -Service $service -StateServices $state.services
+  }
+  $enabledFailures = $finalStatuses | Where-Object { $_.Enabled -and -not $_.Healthy }
+  if (-not $enabledFailures -or $enabledFailures.Count -eq 0) {
+    $script:HadErrors = $false
+  }
+}
+
+function Stop-A11Stack {
+  $stopOrder = @('frontend', 'backend', 'qflush', 'tts', 'llm')
+  foreach ($serviceKey in $stopOrder) {
+    $service = $definitionBundle.Services | Where-Object { $_.Key -eq $serviceKey } | Select-Object -First 1
+    if (-not $service) { continue }
+
+    $stateEntry = $null
+    if ($state.services.ContainsKey($service.Key)) {
+      $stateEntry = $state.services[$service.Key]
+    }
+    $managedByLauncher = $false
+    if ($stateEntry -and $null -ne $stateEntry.managedByLauncher) {
+      $managedByLauncher = [bool]$stateEntry.managedByLauncher
+    }
+
+    if (-not $managedByLauncher) {
+      $ownedPid = Resolve-OwnedServicePid -Service $service
+      if ($ownedPid) {
+        $managedByLauncher = $true
+        $stateEntry = @{
+          pid = $ownedPid
+          port = $service.Port
+          healthUrl = $service.HealthUrl
+          managedByLauncher = $true
+        }
+        $state.services[$service.Key] = $stateEntry
+      }
+    }
+
+    if (-not $service.Enabled -and -not $managedByLauncher) {
+      Write-Info "$($service.DisplayName) ignored (disabled in config)"
+      if ($stateEntry -and $state.services.ContainsKey($service.Key)) {
+        $state.services.Remove($service.Key)
+      }
+      continue
+    }
+    if (-not $managedByLauncher) {
+      if ($stateEntry -and $state.services.ContainsKey($service.Key)) {
+        $state.services.Remove($service.Key)
+      }
+      if ($service.Port -and (Get-ListeningProcessId -Port $service.Port)) {
+        Write-Info "$($service.DisplayName) left running (external process not owned by launcher)"
+      } else {
+        Write-Info "$($service.DisplayName) already stopped"
+      }
+      continue
+    }
+
+    $targetPid = $null
+    if ($stateEntry -and $stateEntry.pid) {
+      $targetPid = [int]$stateEntry.pid
+    }
+
+    if ($targetPid) {
+      Write-Info "Stopping $($service.DisplayName) (PID $targetPid)"
+      Stop-ProcessTree -ProcessId $targetPid
+    } else {
+      Write-Info "$($service.DisplayName) already stopped"
+    }
+
+    if ($state.services.ContainsKey($service.Key)) {
+      $state.services.Remove($service.Key)
+    }
+  }
+  Save-State -Path $stateFile -State $state
 }
 
 $launcherDirectory = Split-Path -Parent $PSCommandPath
@@ -1146,55 +1356,12 @@ switch ($Command) {
   }
 
   'stop' {
-    $stopOrder = @('frontend', 'backend', 'qflush', 'tts', 'llm')
-    foreach ($serviceKey in $stopOrder) {
-      $service = $definitionBundle.Services | Where-Object { $_.Key -eq $serviceKey } | Select-Object -First 1
-      if (-not $service) { continue }
+    Stop-A11Stack
+  }
 
-      $stateEntry = $null
-      if ($state.services.ContainsKey($service.Key)) {
-        $stateEntry = $state.services[$service.Key]
-      }
-      $managedByLauncher = $false
-      if ($stateEntry -and $null -ne $stateEntry.managedByLauncher) {
-        $managedByLauncher = [bool]$stateEntry.managedByLauncher
-      }
-      if (-not $service.Enabled -and -not $managedByLauncher) {
-        Write-Info "$($service.DisplayName) ignored (disabled in config)"
-        if ($stateEntry -and $state.services.ContainsKey($service.Key)) {
-          $state.services.Remove($service.Key)
-        }
-        continue
-      }
-      if (-not $managedByLauncher) {
-        if ($stateEntry -and $state.services.ContainsKey($service.Key)) {
-          $state.services.Remove($service.Key)
-        }
-        if ($service.Port -and (Get-ListeningProcessId -Port $service.Port)) {
-          Write-Info "$($service.DisplayName) left running (external process not owned by launcher)"
-        } else {
-          Write-Info "$($service.DisplayName) already stopped"
-        }
-        continue
-      }
-
-      $targetPid = $null
-      if ($stateEntry -and $stateEntry.pid) {
-        $targetPid = [int]$stateEntry.pid
-      }
-
-      if ($targetPid) {
-        Write-Info "Stopping $($service.DisplayName) (PID $targetPid)"
-        Stop-ProcessTree -ProcessId $targetPid
-      } else {
-        Write-Info "$($service.DisplayName) already stopped"
-      }
-
-      if ($state.services.ContainsKey($service.Key)) {
-        $state.services.Remove($service.Key)
-      }
-    }
-    Save-State -Path $stateFile -State $state
+  'restart' {
+    Stop-A11Stack
+    Start-A11Stack
   }
 
   'package' {
