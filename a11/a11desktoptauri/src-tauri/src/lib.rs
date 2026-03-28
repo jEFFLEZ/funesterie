@@ -1311,6 +1311,11 @@ async fn start_stack(app: AppHandle) -> Result<RuntimeSnapshot, String> {
             .as_ref()
             .map(|operation| operation.active)
             .unwrap_or(false)
+            || existing_snapshot
+                .progress
+                .as_ref()
+                .map(|progress| progress.active)
+                .unwrap_or(false)
         {
             let mut snapshot = existing_snapshot.clone();
             if snapshot.message.is_none() {
@@ -1366,6 +1371,11 @@ async fn restart_stack(app: AppHandle) -> Result<RuntimeSnapshot, String> {
             .as_ref()
             .map(|operation| operation.active)
             .unwrap_or(false)
+            || existing_snapshot
+                .progress
+                .as_ref()
+                .map(|progress| progress.active)
+                .unwrap_or(false)
         {
             let mut snapshot = existing_snapshot.clone();
             if snapshot.message.is_none() {

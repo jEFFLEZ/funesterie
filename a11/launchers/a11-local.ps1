@@ -1401,6 +1401,13 @@ function Get-LauncherStatusSnapshot {
   return $snapshot
 }
 
+function Update-LauncherSnapshotCache {
+  try {
+    [void](Get-LauncherStatusSnapshot)
+  } catch {
+  }
+}
+
 function Open-A11DesktopWindow {
   param(
     [string]$Url,
@@ -1434,6 +1441,7 @@ function Start-A11Stack {
   param([switch]$DesktopWindow)
 
   Set-LauncherProgress -Path $progressFile -Phase 'validation' -Message 'Verification de la stack locale...'
+  Update-LauncherSnapshotCache
   $validationStateChanged = $false
 
   foreach ($service in $definitionBundle.Services) {
@@ -1465,11 +1473,13 @@ function Start-A11Stack {
   }
   if ($validationStateChanged) {
     Save-State -Path $stateFile -State $state
+    Update-LauncherSnapshotCache
   }
   if ($script:HadErrors) { return }
 
   if ($uiMode -eq 'embedded') {
     Set-LauncherProgress -Path $progressFile -Phase 'ui-build' -Message 'Preparation de l interface embarquee...'
+    Update-LauncherSnapshotCache
     Ensure-EmbeddedUiBuild `
       -FrontendDirectory $definitionBundle.FrontendDir `
       -WebDistDirectory $definitionBundle.WebDistDirectory `
@@ -1480,6 +1490,7 @@ function Start-A11Stack {
   }
   if ($definitionBundle.EnableQflush) {
     Set-LauncherProgress -Path $progressFile -Phase 'qflush-build' -Message 'Preparation de Qflush...'
+    Update-LauncherSnapshotCache
     [void](Ensure-QflushBuild -QflushDirectory $definitionBundle.QflushDir -NpmCommand $npmCommand)
     ($definitionBundle.Services | Where-Object { $_.Key -eq 'qflush' } | Select-Object -First 1).ArgumentList = @((Join-Path $definitionBundle.QflushDir 'dist\daemon\qflushd.js'))
   }
@@ -1506,6 +1517,7 @@ function Start-A11Stack {
     }
 
     Set-LauncherProgress -Path $progressFile -Phase 'service-start' -Message "Demarrage de $($service.DisplayName)..." -ServiceKey $service.Key -ServiceLabel $service.DisplayName
+    Update-LauncherSnapshotCache
     $started = Start-ManagedProcess -Service $service -LogsDirectory $logsDirectory -ShowWindow:$ShowWindows
     $service | Add-Member -NotePropertyName Pid -NotePropertyValue $started.Pid -Force
     $state.services[$service.Key] = @{
@@ -1518,14 +1530,18 @@ function Start-A11Stack {
       managedByLauncher = $true
     }
     Save-State -Path $stateFile -State $state
+    Update-LauncherSnapshotCache
     Set-LauncherProgress -Path $progressFile -Phase 'service-wait' -Message "Attente de $($service.DisplayName)..." -ServiceKey $service.Key -ServiceLabel $service.DisplayName
+    Update-LauncherSnapshotCache
     if (-not (Wait-UntilReady -Service $service)) {
       Write-ErrorLine "$($service.DisplayName) did not become ready in time"
     }
+    Update-LauncherSnapshotCache
   }
 
   if (-not $script:HadErrors) {
     Set-LauncherProgress -Path $progressFile -Phase 'finalizing' -Message 'Finalisation de la stack locale...'
+    Update-LauncherSnapshotCache
     Write-Info "UI: $localUiUrl"
     Write-Info "API: $localApiUrl"
     Write-Info "TTS: $localTtsUrl"
@@ -1553,10 +1569,12 @@ function Start-A11Stack {
   if (-not $enabledFailures -or $enabledFailures.Count -eq 0) {
     $script:HadErrors = $false
   }
+  Update-LauncherSnapshotCache
 }
 
 function Stop-A11Stack {
   Set-LauncherProgress -Path $progressFile -Phase 'stop' -Message 'Arret de la stack locale...'
+  Update-LauncherSnapshotCache
   $stopOrder = @('frontend', 'backend', 'qflush', 'tts', 'llm')
   foreach ($serviceKey in $stopOrder) {
     $service = $definitionBundle.Services | Where-Object { $_.Key -eq $serviceKey } | Select-Object -First 1
@@ -1629,6 +1647,7 @@ function Stop-A11Stack {
     }
   }
   Save-State -Path $stateFile -State $state
+  Update-LauncherSnapshotCache
 }
 
 $launcherDirectory = Split-Path -Parent $PSCommandPath

@@ -58,6 +58,16 @@ type RuntimeOperationSnapshot = {
   startedAt?: string | null;
 };
 
+type RuntimeProgressSnapshot = {
+  active: boolean;
+  phase: string;
+  message: string;
+  serviceKey?: string | null;
+  serviceLabel?: string | null;
+  updatedAt?: string | null;
+  pid?: number | null;
+};
+
 type RuntimeSnapshot = {
   appName: string;
   launcherMode: string;
@@ -70,6 +80,7 @@ type RuntimeSnapshot = {
   remoteProviders: RemoteProviderSnapshot[];
   remoteSetup: RemoteSetupSnapshot;
   operation?: RuntimeOperationSnapshot | null;
+  progress?: RuntimeProgressSnapshot | null;
   message?: string | null;
 };
 
@@ -129,8 +140,8 @@ function hasManagedOrExternalStack(snapshot: RuntimeSnapshot | null) {
   );
 }
 
-function isLauncherOperationActive(snapshot: RuntimeSnapshot | null) {
-  return !!snapshot?.operation?.active;
+function isLauncherBusy(snapshot: RuntimeSnapshot | null) {
+  return !!snapshot?.operation?.active || !!snapshot?.progress?.active;
 }
 
 function getSelectedRemoteProvider(snapshot: RuntimeSnapshot | null, providerId?: string | null) {
@@ -379,8 +390,8 @@ function renderSnapshot(snapshot: RuntimeSnapshot | null) {
   renderServices(snapshot.services);
   renderEngine(snapshot);
   openBtn?.toggleAttribute("hidden", !snapshot.ready);
-  launchBtn?.toggleAttribute("disabled", modelGate || remoteNeedsConfig || state.busy || isLauncherOperationActive(snapshot));
-  retryBtn?.toggleAttribute("disabled", !hasManagedOrExternalStack(snapshot) || state.busy || isLauncherOperationActive(snapshot));
+  launchBtn?.toggleAttribute("disabled", modelGate || remoteNeedsConfig || state.busy || isLauncherBusy(snapshot));
+  retryBtn?.toggleAttribute("disabled", !hasManagedOrExternalStack(snapshot) || state.busy || isLauncherBusy(snapshot));
 }
 
 function renderError(message: string) {
@@ -487,7 +498,7 @@ async function monitorPendingStartup(label: string) {
         return lastSnapshot;
       }
 
-      if (!isLauncherOperationActive(lastSnapshot) && !hasManagedOrExternalStack(lastSnapshot)) {
+      if (!isLauncherBusy(lastSnapshot) && !hasManagedOrExternalStack(lastSnapshot)) {
         return lastSnapshot;
       }
 
@@ -767,7 +778,7 @@ window.addEventListener("DOMContentLoaded", async () => {
     if (snapshot.remoteSetup.mode === "remote") {
       return;
     }
-    if (isLauncherOperationActive(snapshot) || hasManagedOrExternalStack(snapshot)) {
+    if (isLauncherBusy(snapshot) || hasManagedOrExternalStack(snapshot)) {
       void monitorPendingStartup("Demarrage deja lance");
       return;
     }
