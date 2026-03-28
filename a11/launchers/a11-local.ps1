@@ -1031,7 +1031,9 @@ function Get-ServiceStatus {
   }
   $healthy = $false
   if ($Service.HealthMode -eq 'http') {
-    $healthy = Test-HttpReady -Url $Service.HealthUrl -TimeoutSec 2
+    if ($listeningPid -or $alive -or (-not $Service.Port)) {
+      $healthy = Test-HttpReady -Url $Service.HealthUrl -TimeoutSec 2
+    }
   }
   if (-not $healthy -and $Service.Port) {
     $healthy = $null -ne $listeningPid
@@ -1097,9 +1099,9 @@ function Get-LauncherStatusSnapshot {
   $backendUiReady = @($rows | Where-Object { $_.key -eq 'backend' -and $_.ready }).Count -gt 0
   $frontendUiReady = @($rows | Where-Object { $_.key -eq 'frontend' -and $_.ready }).Count -gt 0
   $uiReady = if ($uiMode -eq 'embedded') {
-    $backendUiReady -or (Test-UiReady -Url $localUiUrl)
+    $backendUiReady
   } else {
-    $frontendUiReady -or (Test-UiReady -Url $localUiUrl)
+    $frontendUiReady
   }
 
   return [pscustomobject]@{

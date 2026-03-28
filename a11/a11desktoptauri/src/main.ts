@@ -113,6 +113,12 @@ function isServiceReady(snapshot: RuntimeSnapshot | null, key: string) {
   return !!getService(snapshot, key)?.ready;
 }
 
+function hasManagedOrExternalStack(snapshot: RuntimeSnapshot | null) {
+  return !!snapshot?.services?.some((service) =>
+    service.state.startsWith("running") || service.state.startsWith("degraded")
+  );
+}
+
 function getSelectedRemoteProvider(snapshot: RuntimeSnapshot | null, providerId?: string | null) {
   const selectedId = String(
     providerId ||
@@ -360,6 +366,7 @@ function renderSnapshot(snapshot: RuntimeSnapshot | null) {
   renderEngine(snapshot);
   openBtn?.toggleAttribute("hidden", !snapshot.ready);
   launchBtn?.toggleAttribute("disabled", modelGate || remoteNeedsConfig || state.busy);
+  retryBtn?.toggleAttribute("disabled", !hasManagedOrExternalStack(snapshot) || state.busy);
 }
 
 function renderError(message: string) {
