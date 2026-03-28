@@ -70,6 +70,8 @@ const state = {
   snapshot: null as RuntimeSnapshot | null,
   error: "",
 };
+const STARTUP_POLL_MS = 2000;
+const STARTUP_TIMEOUT_MS = 8 * 60 * 1000;
 
 const phasePill = document.querySelector<HTMLElement>("#phase-pill");
 const summaryEl = document.querySelector<HTMLElement>("#summary");
@@ -154,8 +156,6 @@ function setBusy(busy: boolean, label = "Initialisation") {
     openBtn,
     refreshBtn,
     stopBtn,
-    logsBtn,
-    quitBtn,
     modelImportBtn,
     modelDownloadBtn,
     modelFolderBtn,
@@ -170,6 +170,18 @@ function setBusy(busy: boolean, label = "Initialisation") {
     if (!element) return;
     element.disabled = busy;
   });
+
+  if (logsBtn) {
+    logsBtn.disabled = false;
+  }
+
+  if (stopBtn) {
+    stopBtn.disabled = false;
+  }
+
+  if (quitBtn) {
+    quitBtn.disabled = false;
+  }
 }
 
 function renderServices(services: ServiceSnapshot[]) {
@@ -332,7 +344,9 @@ function renderSnapshot(snapshot: RuntimeSnapshot | null) {
     !snapshot.ready;
 
   summaryEl.textContent = snapshot.ready
-    ? `La stack locale est prete. Le chat va s'ouvrir sur ${snapshot.uiUrl}.`
+    ? `La stack locale est prete. Le chat A11 est disponible sur ${snapshot.uiUrl}.`
+    : snapshot.message
+      ? snapshot.message
     : remoteConfiguredPending
       ? "IA distante configuree. Clique sur Lancer A11 pour demarrer la stack sans gel automatique."
     : remoteNeedsConfig
@@ -370,9 +384,42 @@ async function fetchSnapshot() {
   return snapshot;
 }
 
-async function openChatAndCloseShell() {
+async function openChatWindow() {
   await invoke("open_chat_window");
-  await invoke("close_shell_window");
+}
+
+async function waitForReadyAfterStart(label: string) {
+  const deadline = Date.now() + STARTUP_TIMEOUT_MS;
+  let lastSnapshot = state.snapshot;
+
+  while (Date.now() < deadline) {
+    await new Promise((resolve) => window.setTimeout(resolve, STARTUP_POLL_MS));
+    lastSnapshot = await fetchSnapshot();
+
+    if (lastSnapshot?.ready) {
+      return lastSnapshot;
+    }
+
+    if (needsModelSetup(lastSnapshot)) {
+      return lastSnapshot;
+    }
+
+    if (
+      lastSnapshot?.remoteSetup?.mode === "remote" &&
+      !lastSnapshot?.remoteSetup?.configured
+    ) {
+      return lastSnapshot;
+    }
+
+    if (lastSnapshot?.message) {
+      renderNotice(lastSnapshot.message);
+    } else {
+      renderNotice(`${label} en cours. A11 attend encore la fin de chargement des services...`);
+    }
+  }
+
+  renderNotice("Le demarrage prend plus de temps que prevu. Tu peux patienter, actualiser, ou ouvrir les logs.");
+  return lastSnapshot;
 }
 
 async function startStack(label = "Demarrage") {
@@ -383,8 +430,14 @@ async function startStack(label = "Demarrage") {
     const snapshot = await invoke<RuntimeSnapshot>("start_stack");
     state.snapshot = snapshot;
     renderSnapshot(snapshot);
-    if (snapshot.ready) {
-      await openChatAndCloseShell();
+    if (snapshot.message) {
+      renderNotice(snapshot.message);
+    }
+
+    const finalSnapshot = await waitForReadyAfterStart("Relance");
+    if (finalSnapshot?.ready) {
+      await openChatWindow();
+      renderNotice("A11 est pret. Le chat est ouvert et le shell reste disponible.");
     }
   } catch (error) {
     renderError(error instanceof Error ? error.message : String(error));
@@ -417,8 +470,14 @@ async function restartStack() {
     const snapshot = await invoke<RuntimeSnapshot>("restart_stack");
     state.snapshot = snapshot;
     renderSnapshot(snapshot);
-    if (snapshot.ready) {
-      await openChatAndCloseShell();
+    if (snapshot.message) {
+      renderNotice(snapshot.message);
+    }
+
+    const finalSnapshot = await waitForReadyAfterStart("Relance");
+    if (finalSnapshot?.ready) {
+      await openChatWindow();
+      renderNotice("A11 est pret. Le chat est ouvert et le shell reste disponible.");
     }
   } catch (error) {
     renderError(error instanceof Error ? error.message : String(error));
@@ -467,7 +526,9 @@ async function selectLocalModelProfile(profileId: string) {
     });
     state.snapshot = snapshot;
     renderSnapshot(snapshot);
-    if (isServiceReady(snapshot, "llm")) {
+    if (needsModelSetup(snapshot)) {
+      renderNotice("Profil enregistre. Importe ou telecharge maintenant le GGUF correspondant, puis relance A11.");
+    } else if (isServiceReady(snapshot, "llm")) {
       renderNotice("Profil enregistre. Clique sur Relancer pour appliquer ce moteur.");
     }
   } catch (error) {
@@ -538,7 +599,7 @@ window.addEventListener("DOMContentLoaded", async () => {
   });
 
   openBtn?.addEventListener("click", () => {
-    void openChatAndCloseShell().catch((error) => {
+    void openChatWindow().catch((error) => {
       renderError(error instanceof Error ? error.message : String(error));
     });
   });
@@ -608,7 +669,7 @@ window.addEventListener("DOMContentLoaded", async () => {
   try {
     const snapshot = await fetchSnapshot();
     if (snapshot.ready) {
-      await openChatAndCloseShell();
+      renderNotice("A11 est deja pret. Ouvre le chat quand tu veux.");
       return;
     }
     if (needsModelSetup(snapshot)) {

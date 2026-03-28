@@ -1,5 +1,5 @@
 param(
-  [ValidateSet('start', 'desktop', 'stop', 'restart', 'status', 'check', 'package')]
+  [ValidateSet('start', 'desktop', 'stop', 'restart', 'status', 'status-json', 'check', 'package')]
   [string]$Command = 'start',
   [string]$ConfigPath = '',
   [switch]$NoOpen,
@@ -224,6 +224,20 @@ function Test-HttpReady {
   try {
     $response = Invoke-WebRequest -Uri $Url -Method Get -TimeoutSec $TimeoutSec -ErrorAction Stop
     return ($response.StatusCode -ge 200 -and $response.StatusCode -lt 500)
+  } catch {
+    return $false
+  }
+}
+
+function Test-UiReady {
+  param(
+    [string]$Url,
+    [int]$TimeoutSec = 4
+  )
+
+  try {
+    $response = Invoke-WebRequest -Uri $Url -Method Get -TimeoutSec $TimeoutSec -ErrorAction Stop
+    return ($response.StatusCode -ge 200 -and $response.StatusCode -lt 400)
   } catch {
     return $false
   }
@@ -688,6 +702,7 @@ function Write-PackagedConfig {
     'A11_LLM_MODEL=..\llm\llm\models\Llama-3.2-3B-Instruct-Q4_K_M.gguf',
     'A11_LLM_MODEL_CATALOG_ID=llama32-3b-q4km',
     'A11_LLM_MODEL_URL=',
+    'A11_REMOTE_PROVIDER_CATALOG_FILE=config\remote-providers.json',
     'A11_TTS_MODEL=..\tts\fr_FR-siwis-medium.onnx',
     'A11_TTS_PIPER=..\tts\piper.exe',
     'A11_TTS_ESPEAK=..\tts\espeak-ng-data',
@@ -731,6 +746,7 @@ function Build-ServiceDefinitions {
   $ttsModel = Resolve-LauncherRelativePath -Value (Get-ConfigValue $Config 'A11_TTS_MODEL' '..\a11backendrailway\apps\tts\fr_FR-siwis-medium.onnx') -BaseDirectory $LauncherDirectory
   $ttsPiper = Resolve-LauncherRelativePath -Value (Get-ConfigValue $Config 'A11_TTS_PIPER' '..\a11backendrailway\apps\tts\piper.exe') -BaseDirectory $LauncherDirectory
   $ttsEspeak = Resolve-LauncherRelativePath -Value (Get-ConfigValue $Config 'A11_TTS_ESPEAK' '..\a11backendrailway\apps\tts\espeak-ng-data') -BaseDirectory $LauncherDirectory
+  $remoteProviderCatalogFile = Resolve-LauncherRelativePath -Value (Get-ConfigValue $Config 'A11_REMOTE_PROVIDER_CATALOG_FILE' 'config\remote-providers.json') -BaseDirectory $LauncherDirectory
 
   $enableBackend = To-BoolValue (Get-ConfigValue $Config 'A11_ENABLE_BACKEND' '1') $true
   $enableTts = To-BoolValue (Get-ConfigValue $Config 'A11_ENABLE_TTS' '1') $true
@@ -784,6 +800,7 @@ function Build-ServiceDefinitions {
   $services += [pscustomobject]@{
     Key = 'llm'
     DisplayName = 'A11 LLM'
+    Required = $true
     Enabled = $effectiveEnableLlm
     FilePath = $llmExe
     WorkingDirectory = (Split-Path -Parent $llmExe)
@@ -803,6 +820,7 @@ function Build-ServiceDefinitions {
   $services += [pscustomobject]@{
     Key = 'tts'
     DisplayName = 'A11 TTS'
+    Required = $true
     Enabled = $enableTts
     FilePath = $PythonCommand
     WorkingDirectory = $ttsDir
@@ -833,6 +851,7 @@ function Build-ServiceDefinitions {
   $services += [pscustomobject]@{
     Key = 'qflush'
     DisplayName = 'Qflush'
+    Required = $false
     Enabled = $enableQflush
     FilePath = $NodeCommand
     WorkingDirectory = $qflushDir
@@ -878,6 +897,7 @@ function Build-ServiceDefinitions {
     OPENAI_MODEL = $openAiModel
     A11_OPENAI_MODEL = $openAiModel
     A11_REMOTE_PROVIDER_ID = $remoteProviderId
+    A11_REMOTE_PROVIDER_CATALOG_FILE = $remoteProviderCatalogFile
     A11_CHAT_PROVIDER_MODE = $chatProviderMode
     TTS_PORT = $ttsPort
     TTS_URL = $LocalTtsUrl
@@ -895,6 +915,7 @@ function Build-ServiceDefinitions {
   $services += [pscustomobject]@{
     Key = 'backend'
     DisplayName = 'A11 Backend'
+    Required = $true
     Enabled = $enableBackend
     FilePath = $NodeCommand
     WorkingDirectory = $backendDir
@@ -916,6 +937,7 @@ function Build-ServiceDefinitions {
     $services += [pscustomobject]@{
       Key = 'frontend'
       DisplayName = 'A11 Frontend'
+      Required = $false
       Enabled = $true
       FilePath = $NpmCommand
       WorkingDirectory = $frontendDir
@@ -965,6 +987,7 @@ function Build-ServiceDefinitions {
     ChatProviderMode = $chatProviderMode
     UseRemoteProvider = $useRemoteProvider
     RemoteProviderId = $remoteProviderId
+    RemoteProviderCatalogFile = $remoteProviderCatalogFile
     OpenAiBaseUrl = $openAiBaseUrl
     OpenAiModel = $openAiModel
   }
@@ -1050,6 +1073,47 @@ function Get-ServiceStatus {
     Pid = $resolvedPid
     Healthy = $healthy
     Url = $Service.HealthUrl
+  }
+}
+
+function Get-LauncherStatusSnapshot {
+  $rows = foreach ($service in $definitionBundle.Services) {
+    $status = Get-ServiceStatus -Service $service -StateServices $state.services
+    [pscustomobject]@{
+      key = $service.Key
+      label = $service.DisplayName
+      enabled = [bool]$status.Enabled
+      state = [string]$status.State
+      port = if ($null -ne $status.Port) { [int]$status.Port } else { $null }
+      pid = if ($null -ne $status.Pid) { [int]$status.Pid } else { $null }
+      ready = [bool]$status.Healthy
+      required = [bool]$service.Required
+      healthUrl = [string]$status.Url
+    }
+  }
+
+  $requiredReady = @($rows | Where-Object { $_.required -and $_.enabled }).Count -eq 0 -or
+    (@($rows | Where-Object { $_.required -and $_.enabled -and -not $_.ready }).Count -eq 0)
+  $backendUiReady = @($rows | Where-Object { $_.key -eq 'backend' -and $_.ready }).Count -gt 0
+  $frontendUiReady = @($rows | Where-Object { $_.key -eq 'frontend' -and $_.ready }).Count -gt 0
+  $uiReady = if ($uiMode -eq 'embedded') {
+    $backendUiReady -or (Test-UiReady -Url $localUiUrl)
+  } else {
+    $frontendUiReady -or (Test-UiReady -Url $localUiUrl)
+  }
+
+  return [pscustomobject]@{
+    ok = (-not $script:HadErrors)
+    command = $Command
+    uiMode = $uiMode
+    uiUrl = $localUiUrl
+    uiReady = $uiReady
+    requiredServicesReady = $requiredReady
+    ready = ($requiredReady -and $uiReady)
+    logsDirectory = $logsDirectory
+    launcherConfig = $resolvedConfigPath
+    remoteProviderCatalogFile = $definitionBundle.RemoteProviderCatalogFile
+    services = $rows
   }
 }
 
@@ -1353,6 +1417,11 @@ switch ($Command) {
       Get-ServiceStatus -Service $service -StateServices $state.services
     }
     $rows | Sort-Object Service | Format-Table Service,State,Port,Pid,Healthy,Url -AutoSize
+  }
+
+  'status-json' {
+    $snapshot = Get-LauncherStatusSnapshot
+    $snapshot | ConvertTo-Json -Depth 8
   }
 
   'stop' {

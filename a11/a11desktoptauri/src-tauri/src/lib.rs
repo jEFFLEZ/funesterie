@@ -130,6 +130,25 @@ struct RuntimeSnapshot {
     message: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LauncherStatusSnapshot {
+    ui_url: Option<String>,
+    ui_ready: Option<bool>,
+    services: Option<Vec<LauncherServiceSnapshot>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LauncherServiceSnapshot {
+    key: String,
+    state: Option<String>,
+    enabled: Option<bool>,
+    ready: Option<bool>,
+    required: Option<bool>,
+    port: Option<u16>,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ServiceSnapshot {
@@ -843,6 +862,21 @@ fn service_port(config: &DesktopConfig, key: &str) -> Option<u16> {
         .map(|service| service.port)
 }
 
+fn is_http_url_ready(url: &str) -> bool {
+    let client = match reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+    {
+        Ok(client) => client,
+        Err(_) => return false,
+    };
+
+    match client.get(url).send() {
+        Ok(response) => response.status().is_success() || response.status().is_redirection(),
+        Err(_) => false,
+    }
+}
+
 fn is_port_ready(host: &str, port: u16) -> bool {
     let endpoint = format!("{host}:{port}");
     let Ok(addresses) = endpoint.to_socket_addrs() else {
@@ -851,6 +885,20 @@ fn is_port_ready(host: &str, port: u16) -> bool {
 
     addresses.into_iter().any(|address| {
         TcpStream::connect_timeout(&address, Duration::from_millis(350)).is_ok()
+    })
+}
+
+fn run_launcher_json_command<T: for<'de> Deserialize<'de>>(
+    runtime_paths: &RuntimePaths,
+    command_name: &str,
+    extra_args: &[&str],
+) -> Result<T, String> {
+    let output = run_launcher_command(runtime_paths, command_name, extra_args)?;
+    serde_json::from_str::<T>(output.trim()).map_err(|error| {
+        format!(
+            "Reponse JSON invalide du launcher pour '{command_name}': {error}. Sortie: {}",
+            output.trim()
+        )
     })
 }
 
@@ -876,6 +924,9 @@ fn build_runtime_snapshot(
     let config = load_desktop_config()?;
     let runtime_paths = resolve_runtime_paths(app, &config)?;
     let flags = parse_launcher_env(&runtime_paths.launcher_config);
+    let launcher_status =
+        run_launcher_json_command::<LauncherStatusSnapshot>(&runtime_paths, "status-json", &["-NoPause"])
+            .ok();
     let model_setup = resolve_model_setup_from_flags(&config, &runtime_paths, &flags)?;
     let remote_setup = resolve_remote_setup_from_flags(&config, &flags);
     let local_models = build_local_model_snapshots(&config);
@@ -886,26 +937,45 @@ fn build_runtime_snapshot(
         .service_ports
         .iter()
         .map(|service| {
-            let enabled = env_flag(&flags, &service.enable_env_key, true);
-            let ready = is_port_ready(&config.runtime.host, service.port);
-            let state = if !enabled && ready {
-                "external"
-            } else if !enabled {
-                "disabled"
-            } else if ready {
-                "ready"
-            } else {
-                "offline"
-            };
+            let launcher_service = launcher_status
+                .as_ref()
+                .and_then(|status| status.services.as_ref())
+                .and_then(|items| items.iter().find(|entry| entry.key == service.key));
+
+            let enabled = launcher_service
+                .and_then(|entry| entry.enabled)
+                .unwrap_or_else(|| env_flag(&flags, &service.enable_env_key, true));
+            let ready = launcher_service
+                .and_then(|entry| entry.ready)
+                .unwrap_or_else(|| is_port_ready(&config.runtime.host, service.port));
+            let state = launcher_service
+                .and_then(|entry| entry.state.clone())
+                .unwrap_or_else(|| {
+                    if !enabled && ready {
+                        "external".to_string()
+                    } else if !enabled {
+                        "disabled".to_string()
+                    } else if ready {
+                        "ready".to_string()
+                    } else {
+                        "offline".to_string()
+                    }
+                });
+            let required = launcher_service
+                .and_then(|entry| entry.required)
+                .unwrap_or(service.required);
+            let port = launcher_service
+                .and_then(|entry| entry.port)
+                .unwrap_or(service.port);
 
             ServiceSnapshot {
                 key: service.key.clone(),
                 label: service.label.clone(),
-                port: service.port,
+                port,
                 enabled,
                 ready,
-                required: service.required,
-                state: state.to_string(),
+                required,
+                state,
             }
         })
         .collect::<Vec<_>>();
@@ -914,11 +984,29 @@ fn build_runtime_snapshot(
         .iter()
         .filter(|service| service.required && service.enabled)
         .all(|service| service.ready);
+    let ui_url = launcher_status
+        .as_ref()
+        .and_then(|status| status.ui_url.clone())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| config.runtime.ui_url.clone());
+    let ui_ready = launcher_status
+        .as_ref()
+        .and_then(|status| status.ui_ready)
+        .unwrap_or_else(|| is_http_url_ready(&ui_url));
     let ready = required_services_ready
+        && ui_ready
         && (!model_setup.installer_lite || (model_setup.model_exists && model_setup.model_enabled));
 
     let resolved_message = if ready || !model_setup.installer_lite || model_setup.model_exists {
-        message
+        message.or_else(|| {
+            if !ui_ready {
+                Some("Les services repondent mais l'interface termine encore son chargement.".to_string())
+            } else if !required_services_ready {
+                Some("La stack locale demarre encore sur cette machine. Patiente quelques secondes.".to_string())
+            } else {
+                None
+            }
+        })
     } else {
         Some(format!(
             "Modele local requis avant le demarrage du LLM. Ajoute {} puis relance A11.",
@@ -930,7 +1018,7 @@ fn build_runtime_snapshot(
         app_name: config.app_name,
         launcher_mode: runtime_paths.launcher_mode,
         ready,
-        ui_url: config.runtime.ui_url,
+        ui_url,
         logs_dir: runtime_paths.logs_dir.display().to_string(),
         services,
         model_setup,
@@ -1041,6 +1129,52 @@ fn run_launcher_command(
     }
 }
 
+fn spawn_launcher_command(
+    runtime_paths: &RuntimePaths,
+    command_name: &str,
+    extra_args: &[&str],
+) -> Result<(), String> {
+    if !runtime_paths.launcher_script.exists() {
+        return Err(format!(
+            "Launcher introuvable: {}",
+            runtime_paths.launcher_script.display()
+        ));
+    }
+    if !runtime_paths.launcher_config.exists() {
+        return Err(format!(
+            "Config launcher introuvable: {}",
+            runtime_paths.launcher_config.display()
+        ));
+    }
+
+    let mut command = Command::new("powershell.exe");
+    command.arg("-NoProfile");
+    command.arg("-ExecutionPolicy");
+    command.arg("Bypass");
+    command.arg("-File");
+    command.arg(&runtime_paths.launcher_script);
+    command.arg(command_name);
+    command.arg("-ConfigPath");
+    command.arg(&runtime_paths.launcher_config);
+
+    for arg in extra_args {
+        command.arg(arg);
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    command.stdout(Stdio::null());
+    command.stderr(Stdio::null());
+
+    command
+        .spawn()
+        .map_err(|error| format!("Impossible de lancer le launcher en arriere-plan: {error}"))?;
+    Ok(())
+}
+
 #[tauri::command]
 async fn get_runtime_snapshot(app: AppHandle) -> Result<RuntimeSnapshot, String> {
     tauri::async_runtime::spawn_blocking(move || build_runtime_snapshot(&app, None))
@@ -1067,8 +1201,11 @@ async fn start_stack(app: AppHandle) -> Result<RuntimeSnapshot, String> {
         if runtime_paths.skip_ui_build {
             extra_args.push("-SkipUiBuild");
         }
-        let message = run_launcher_command(&runtime_paths, "start", &extra_args)?;
-        build_runtime_snapshot(&app, Some(message))
+        spawn_launcher_command(&runtime_paths, "start", &extra_args)?;
+        build_runtime_snapshot(
+            &app,
+            Some("Demarrage de la stack locale en cours...".to_string()),
+        )
     })
     .await
     .map_err(|error| format!("Demarrage impossible: {error}"))?
@@ -1105,8 +1242,11 @@ async fn restart_stack(app: AppHandle) -> Result<RuntimeSnapshot, String> {
         if runtime_paths.skip_ui_build {
             extra_args.push("-SkipUiBuild");
         }
-        let message = run_launcher_command(&runtime_paths, "restart", &extra_args)?;
-        build_runtime_snapshot(&app, Some(message))
+        spawn_launcher_command(&runtime_paths, "restart", &extra_args)?;
+        build_runtime_snapshot(
+            &app,
+            Some("Relance de la stack locale en cours...".to_string()),
+        )
     })
     .await
     .map_err(|error| format!("Relance impossible: {error}"))?
