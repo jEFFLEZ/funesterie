@@ -678,7 +678,7 @@ window.addEventListener("DOMContentLoaded", async () => {
     if (snapshot.remoteSetup.mode === "remote") {
       return;
     }
-    await startStack("Demarrage");
+    renderNotice("Clique sur Lancer A11 pour demarrer la stack locale sans bloquer le shell.");
   } catch (error) {
     renderError(error instanceof Error ? error.message : String(error));
   } finally {
