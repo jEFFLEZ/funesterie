@@ -6,7 +6,7 @@ use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder};
 use url::Url;
 
@@ -1686,15 +1686,24 @@ fn open_chat_window(app: AppHandle) -> Result<(), String> {
         return Err("A11 local n'est pas encore pret.".to_string());
     }
 
+    let mut target_url =
+        Url::parse(&snapshot.ui_url).map_err(|error| format!("URL locale invalide: {error}"))?;
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs().to_string())
+        .unwrap_or_else(|_| "0".to_string());
+    target_url
+        .query_pairs_mut()
+        .append_pair("desktop", "1")
+        .append_pair("ts", &timestamp);
+
     if let Some(window) = app.get_webview_window(&config.chat_window.label) {
+        let _ = window.navigate(target_url.clone());
         let _ = window.show();
         let _ = window.unminimize();
         let _ = window.set_focus();
         return Ok(());
     }
-
-    let target_url =
-        Url::parse(&snapshot.ui_url).map_err(|error| format!("URL locale invalide: {error}"))?;
 
     WebviewWindowBuilder::new(&app, &config.chat_window.label, WebviewUrl::External(target_url))
         .title(&config.chat_window.title)
