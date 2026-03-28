@@ -227,36 +227,6 @@ fn current_exe_dir() -> Option<PathBuf> {
         .and_then(|path| path.parent().map(Path::to_path_buf))
 }
 
-fn copy_directory(source: &Path, target: &Path) -> Result<(), String> {
-    if !source.exists() {
-        return Err(format!("Ressource packagee introuvable: {}", source.display()));
-    }
-
-    if !target.exists() {
-        fs::create_dir_all(target)
-            .map_err(|error| format!("Impossible de creer {}: {error}", target.display()))?;
-    }
-
-    for entry in fs::read_dir(source)
-        .map_err(|error| format!("Impossible de lire {}: {error}", source.display()))?
-    {
-        let entry = entry.map_err(|error| format!("Lecture d'entree impossible: {error}"))?;
-        let entry_path = entry.path();
-        let target_path = target.join(entry.file_name());
-        let file_type = entry
-            .file_type()
-            .map_err(|error| format!("Type de fichier indisponible: {error}"))?;
-
-        if file_type.is_dir() {
-            copy_directory(&entry_path, &target_path)?;
-        } else {
-            copy_file_with_retries(&entry_path, &target_path)?;
-        }
-    }
-
-    Ok(())
-}
-
 fn is_sharing_violation(error: &io::Error) -> bool {
     matches!(error.raw_os_error(), Some(32) | Some(33))
 }
