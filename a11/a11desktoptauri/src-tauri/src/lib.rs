@@ -18,6 +18,7 @@ const CREATE_NO_WINDOW: u32 = 0x08000000;
 const LAUNCHER_TIMEOUT_SEC: u64 = 300;
 
 const DESKTOP_CONFIG_JSON: &str = include_str!("../../desktop.config.json");
+const STATUS_LAUNCHER_TIMEOUT_SEC: u64 = 8;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -114,7 +115,7 @@ struct RuntimePaths {
     skip_ui_build: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct RuntimeSnapshot {
     app_name: String,
@@ -127,6 +128,8 @@ struct RuntimeSnapshot {
     local_models: Vec<LocalModelSnapshot>,
     remote_providers: Vec<RemoteProviderSnapshot>,
     remote_setup: RemoteSetupSnapshot,
+    operation: Option<RuntimeOperationSnapshot>,
+    progress: Option<RuntimeProgressSnapshot>,
     message: Option<String>,
 }
 
@@ -136,6 +139,8 @@ struct LauncherStatusSnapshot {
     ui_url: Option<String>,
     ui_ready: Option<bool>,
     services: Option<Vec<LauncherServiceSnapshot>>,
+    operation: Option<LauncherOperationSnapshot>,
+    progress: Option<LauncherProgressSnapshot>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -149,7 +154,28 @@ struct LauncherServiceSnapshot {
     port: Option<u16>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LauncherOperationSnapshot {
+    active: Option<bool>,
+    command: Option<String>,
+    pid: Option<u32>,
+    started_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LauncherProgressSnapshot {
+    active: Option<bool>,
+    phase: Option<String>,
+    message: Option<String>,
+    service_key: Option<String>,
+    service_label: Option<String>,
+    updated_at: Option<String>,
+    pid: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ServiceSnapshot {
     key: String,
@@ -208,6 +234,27 @@ struct RemoteSetupSnapshot {
     model: String,
     api_key_present: bool,
     configured: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RuntimeOperationSnapshot {
+    active: bool,
+    command: String,
+    pid: Option<u32>,
+    started_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RuntimeProgressSnapshot {
+    active: bool,
+    phase: String,
+    message: String,
+    service_key: Option<String>,
+    service_label: Option<String>,
+    updated_at: Option<String>,
+    pid: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -893,13 +940,31 @@ fn run_launcher_json_command<T: for<'de> Deserialize<'de>>(
     command_name: &str,
     extra_args: &[&str],
 ) -> Result<T, String> {
-    let output = run_launcher_command(runtime_paths, command_name, extra_args)?;
+    let output = run_launcher_command_with_timeout(
+        runtime_paths,
+        command_name,
+        extra_args,
+        STATUS_LAUNCHER_TIMEOUT_SEC,
+    )?;
     serde_json::from_str::<T>(output.trim()).map_err(|error| {
         format!(
             "Reponse JSON invalide du launcher pour '{command_name}': {error}. Sortie: {}",
             output.trim()
         )
     })
+}
+
+fn launcher_snapshot_cache_path(runtime_paths: &RuntimePaths) -> Option<PathBuf> {
+    runtime_paths
+        .logs_dir
+        .parent()
+        .map(|runtime_dir| runtime_dir.join("a11-local.snapshot.json"))
+}
+
+fn read_cached_launcher_snapshot(runtime_paths: &RuntimePaths) -> Option<LauncherStatusSnapshot> {
+    let cache_path = launcher_snapshot_cache_path(runtime_paths)?;
+    let raw = fs::read_to_string(cache_path).ok()?;
+    serde_json::from_str::<LauncherStatusSnapshot>(&raw).ok()
 }
 
 fn ensure_model_target_can_be_updated(config: &DesktopConfig, target_path: &Path) -> Result<(), String> {
@@ -926,11 +991,35 @@ fn build_runtime_snapshot(
     let flags = parse_launcher_env(&runtime_paths.launcher_config);
     let launcher_status =
         run_launcher_json_command::<LauncherStatusSnapshot>(&runtime_paths, "status-json", &["-NoPause"])
-            .ok();
+            .ok()
+            .or_else(|| read_cached_launcher_snapshot(&runtime_paths));
     let model_setup = resolve_model_setup_from_flags(&config, &runtime_paths, &flags)?;
     let remote_setup = resolve_remote_setup_from_flags(&config, &flags);
     let local_models = build_local_model_snapshots(&config);
     let remote_providers = build_remote_provider_snapshots(&config);
+    let operation = launcher_status
+        .as_ref()
+        .and_then(|status| status.operation.clone())
+        .map(|entry| RuntimeOperationSnapshot {
+            active: entry.active.unwrap_or(true),
+            command: entry.command.unwrap_or_else(|| "start".to_string()),
+            pid: entry.pid,
+            started_at: entry.started_at,
+        })
+        .filter(|entry| entry.active);
+    let progress = launcher_status
+        .as_ref()
+        .and_then(|status| status.progress.clone())
+        .map(|entry| RuntimeProgressSnapshot {
+            active: entry.active.unwrap_or(true),
+            phase: entry.phase.unwrap_or_else(|| "pending".to_string()),
+            message: entry.message.unwrap_or_else(|| "Le launcher local travaille encore.".to_string()),
+            service_key: entry.service_key,
+            service_label: entry.service_label,
+            updated_at: entry.updated_at,
+            pid: entry.pid,
+        })
+        .filter(|entry| entry.active);
 
     let services = config
         .runtime
@@ -997,7 +1086,17 @@ fn build_runtime_snapshot(
         && ui_ready
         && (!model_setup.installer_lite || (model_setup.model_exists && model_setup.model_enabled));
 
-    let resolved_message = if ready || !model_setup.installer_lite || model_setup.model_exists {
+    let resolved_message = if let Some(progress_state) = progress.as_ref() {
+        Some(progress_state.message.clone())
+    } else if let Some(active_operation) = operation.as_ref() {
+        if active_operation.command == "restart" {
+            Some("Relance de la stack locale en cours...".to_string())
+        } else if active_operation.command == "stop" {
+            Some("Arret de la stack locale en cours...".to_string())
+        } else {
+            Some("Demarrage de la stack locale en cours...".to_string())
+        }
+    } else if ready || !model_setup.installer_lite || model_setup.model_exists {
         message.or_else(|| {
             if !ui_ready {
                 Some("Les services repondent mais l'interface termine encore son chargement.".to_string())
@@ -1025,14 +1124,17 @@ fn build_runtime_snapshot(
         local_models,
         remote_providers,
         remote_setup,
+        operation,
+        progress,
         message: resolved_message,
     })
 }
 
-fn run_launcher_command(
+fn run_launcher_command_with_timeout(
     runtime_paths: &RuntimePaths,
     command_name: &str,
     extra_args: &[&str],
+    timeout_sec: u64,
 ) -> Result<String, String> {
     if !runtime_paths.launcher_script.exists() {
         return Err(format!(
@@ -1074,7 +1176,7 @@ fn run_launcher_command(
         .map_err(|error| format!("Impossible d'executer le launcher: {error}"))?;
 
     let child_pid = child.id();
-    let deadline = Instant::now() + Duration::from_secs(LAUNCHER_TIMEOUT_SEC);
+    let deadline = Instant::now() + Duration::from_secs(timeout_sec);
 
     loop {
         match child
@@ -1098,7 +1200,7 @@ fn run_launcher_command(
                     let _ = child.wait();
                     return Err(format!(
                         "Le launcher a depasse le delai de {} secondes pendant '{command_name}'.",
-                        LAUNCHER_TIMEOUT_SEC
+                        timeout_sec
                     ));
                 }
                 thread::sleep(Duration::from_millis(250));
@@ -1127,6 +1229,19 @@ fn run_launcher_command(
             details
         })
     }
+}
+
+fn run_launcher_command(
+    runtime_paths: &RuntimePaths,
+    command_name: &str,
+    extra_args: &[&str],
+) -> Result<String, String> {
+    run_launcher_command_with_timeout(
+        runtime_paths,
+        command_name,
+        extra_args,
+        LAUNCHER_TIMEOUT_SEC,
+    )
 }
 
 fn spawn_launcher_command(
@@ -1185,6 +1300,25 @@ async fn get_runtime_snapshot(app: AppHandle) -> Result<RuntimeSnapshot, String>
 #[tauri::command]
 async fn start_stack(app: AppHandle) -> Result<RuntimeSnapshot, String> {
     tauri::async_runtime::spawn_blocking(move || {
+        let existing_snapshot = build_runtime_snapshot(&app, None)?;
+        if existing_snapshot.ready {
+            let mut snapshot = existing_snapshot.clone();
+            snapshot.message = Some("A11 est deja pret. Le chat local peut s'ouvrir tout de suite.".to_string());
+            return Ok(snapshot);
+        }
+        if existing_snapshot
+            .operation
+            .as_ref()
+            .map(|operation| operation.active)
+            .unwrap_or(false)
+        {
+            let mut snapshot = existing_snapshot.clone();
+            if snapshot.message.is_none() {
+                snapshot.message = Some("Le launcher travaille deja sur le demarrage local.".to_string());
+            }
+            return Ok(snapshot);
+        }
+
         let config = load_desktop_config()?;
         let runtime_paths = resolve_runtime_paths(&app, &config)?;
         let model_setup = resolve_model_setup(&config, &runtime_paths)?;
@@ -1226,6 +1360,20 @@ async fn stop_stack(app: AppHandle) -> Result<RuntimeSnapshot, String> {
 #[tauri::command]
 async fn restart_stack(app: AppHandle) -> Result<RuntimeSnapshot, String> {
     tauri::async_runtime::spawn_blocking(move || {
+        let existing_snapshot = build_runtime_snapshot(&app, None)?;
+        if existing_snapshot
+            .operation
+            .as_ref()
+            .map(|operation| operation.active)
+            .unwrap_or(false)
+        {
+            let mut snapshot = existing_snapshot.clone();
+            if snapshot.message.is_none() {
+                snapshot.message = Some("Le launcher travaille deja sur la stack locale.".to_string());
+            }
+            return Ok(snapshot);
+        }
+
         let config = load_desktop_config()?;
         let runtime_paths = resolve_runtime_paths(&app, &config)?;
         let model_setup = resolve_model_setup(&config, &runtime_paths)?;

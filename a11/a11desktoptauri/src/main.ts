@@ -51,6 +51,13 @@ type RemoteSetupSnapshot = {
   configured: boolean;
 };
 
+type RuntimeOperationSnapshot = {
+  active: boolean;
+  command: string;
+  pid?: number | null;
+  startedAt?: string | null;
+};
+
 type RuntimeSnapshot = {
   appName: string;
   launcherMode: string;
@@ -62,6 +69,7 @@ type RuntimeSnapshot = {
   localModels: LocalModelSnapshot[];
   remoteProviders: RemoteProviderSnapshot[];
   remoteSetup: RemoteSetupSnapshot;
+  operation?: RuntimeOperationSnapshot | null;
   message?: string | null;
 };
 
@@ -70,6 +78,7 @@ const state = {
   snapshot: null as RuntimeSnapshot | null,
   error: "",
 };
+let startupMonitorActive = false;
 const STARTUP_POLL_MS = 2000;
 const STARTUP_TIMEOUT_MS = 8 * 60 * 1000;
 const SNAPSHOT_TIMEOUT_MS = 5000;
@@ -118,6 +127,10 @@ function hasManagedOrExternalStack(snapshot: RuntimeSnapshot | null) {
   return !!snapshot?.services?.some((service) =>
     service.state.startsWith("running") || service.state.startsWith("degraded")
   );
+}
+
+function isLauncherOperationActive(snapshot: RuntimeSnapshot | null) {
+  return !!snapshot?.operation?.active;
 }
 
 function getSelectedRemoteProvider(snapshot: RuntimeSnapshot | null, providerId?: string | null) {
@@ -366,8 +379,8 @@ function renderSnapshot(snapshot: RuntimeSnapshot | null) {
   renderServices(snapshot.services);
   renderEngine(snapshot);
   openBtn?.toggleAttribute("hidden", !snapshot.ready);
-  launchBtn?.toggleAttribute("disabled", modelGate || remoteNeedsConfig || state.busy);
-  retryBtn?.toggleAttribute("disabled", !hasManagedOrExternalStack(snapshot) || state.busy);
+  launchBtn?.toggleAttribute("disabled", modelGate || remoteNeedsConfig || state.busy || isLauncherOperationActive(snapshot));
+  retryBtn?.toggleAttribute("disabled", !hasManagedOrExternalStack(snapshot) || state.busy || isLauncherOperationActive(snapshot));
 }
 
 function renderError(message: string) {
@@ -437,6 +450,61 @@ async function waitForReadyAfterStart(label: string) {
   return lastSnapshot;
 }
 
+async function monitorPendingStartup(label: string) {
+  if (startupMonitorActive) {
+    return state.snapshot;
+  }
+
+  startupMonitorActive = true;
+  try {
+    const deadline = Date.now() + STARTUP_TIMEOUT_MS;
+    let lastSnapshot = state.snapshot;
+
+    while (Date.now() < deadline) {
+      await new Promise((resolve) => window.setTimeout(resolve, STARTUP_POLL_MS));
+      lastSnapshot = await fetchSnapshotWithTimeout();
+
+      if (!lastSnapshot) {
+        renderNotice(
+          "La detection locale reste lente, mais le shell continue de surveiller la stack. Tu peux actualiser ou ouvrir les logs."
+        );
+        continue;
+      }
+
+      if (lastSnapshot.ready) {
+        renderNotice("A11 est pret. Ouvre le chat quand tu veux.");
+        return lastSnapshot;
+      }
+
+      if (needsModelSetup(lastSnapshot)) {
+        return lastSnapshot;
+      }
+
+      if (
+        lastSnapshot.remoteSetup.mode === "remote" &&
+        !lastSnapshot.remoteSetup.configured
+      ) {
+        return lastSnapshot;
+      }
+
+      if (!isLauncherOperationActive(lastSnapshot) && !hasManagedOrExternalStack(lastSnapshot)) {
+        return lastSnapshot;
+      }
+
+      if (lastSnapshot.message) {
+        renderNotice(lastSnapshot.message);
+      } else {
+        renderNotice(`${label} en cours. A11 continue de verifier ses services...`);
+      }
+    }
+
+    renderNotice("Le demarrage local est plus long que prevu. Tu peux patienter, actualiser, ou ouvrir les logs.");
+    return lastSnapshot;
+  } finally {
+    startupMonitorActive = false;
+  }
+}
+
 async function startStack(label = "Demarrage") {
   setBusy(true, label);
   renderError("");
@@ -449,7 +517,7 @@ async function startStack(label = "Demarrage") {
       renderNotice(snapshot.message);
     }
 
-    const finalSnapshot = await waitForReadyAfterStart("Relance");
+    const finalSnapshot = await waitForReadyAfterStart(label);
     if (finalSnapshot?.ready) {
       await openChatWindow();
       renderNotice("A11 est pret. Le chat est ouvert et le shell reste disponible.");
@@ -605,6 +673,8 @@ async function switchBackToLocalLlm() {
 }
 
 window.addEventListener("DOMContentLoaded", async () => {
+  renderSnapshot(null);
+
   launchBtn?.addEventListener("click", () => {
     void startStack("Demarrage");
   });
@@ -695,6 +765,10 @@ window.addEventListener("DOMContentLoaded", async () => {
       return;
     }
     if (snapshot.remoteSetup.mode === "remote") {
+      return;
+    }
+    if (isLauncherOperationActive(snapshot) || hasManagedOrExternalStack(snapshot)) {
+      void monitorPendingStartup("Demarrage deja lance");
       return;
     }
     renderNotice("Clique sur Lancer A11 pour demarrer la stack locale sans bloquer le shell.");
